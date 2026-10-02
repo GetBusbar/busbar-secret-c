@@ -5,7 +5,7 @@ First-party signed kind:secret plugin library, written in C from busbar_plugin.h
 
 | kind | alias | crate | busbar | license |
 |---|---|---|---|---|
-| `secret` | `c` | `busbar-secret-c` | 1.6.0 (pinned in `.busbar-ref`) | Apache-2.0 |
+| `secret` | `c` | `busbar-secret-c` | 1.6.0 (pinned in `.busbar-ref`) | MIT |
 
 [![ci](https://github.com/GetBusbar/busbar-secret-c/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/GetBusbar/busbar-secret-c/actions/workflows/ci.yml)
 <!-- fleet:header:end -->
