@@ -5,7 +5,7 @@ First-party signed kind:secret plugin library, written in C from busbar_plugin.h
 
 | kind | alias | crate | busbar | license |
 |---|---|---|---|---|
-| `secret` | `c` | `busbar-secret-c` | 1.6.0 (pinned in `.busbar-ref`) | Apache-2.0 |
+| `secret` | `c` | `busbar-secret-c` | 1.6.0 (pinned in `.busbar-ref`) | MIT |
 
 [![ci](https://github.com/GetBusbar/busbar-secret-c/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/GetBusbar/busbar-secret-c/actions/workflows/ci.yml)
 <!-- fleet:header:end -->
@@ -13,11 +13,24 @@ First-party signed kind:secret plugin library, written in C from busbar_plugin.h
 ## What it is for
 
 `busbar-secret-c` is a `kind: secret` busbar plugin written in C from busbar's generated header
-(`busbar_plugin.h`) alone: no Rust, no busbar crate.
+(`busbar_plugin.h`) alone: no Rust, no busbar crate, no libc header, no allocator. It is decision
+#84's witness (BUSBAR-1.6.0.md): a third party builds a busbar plugin from the header alone, and
+busbar loads it through the same dropped-in door as every Rust plugin.
+
+It serves named secrets whose material is written in its own settings.
 
 ## Config
 
-Configured under the `c` module name.
+Configured under the `c` module name. The instance's settings name each secret and its material:
+
+```json
+{"values": {"db": "s3cr3t", "api": "k3y"}}
+```
+
+A secret reference's settings name one of them: `{"name": "db"}`. A name it does not hold fails
+with NOT_FOUND; a reference that is not `{"name": "<string>"}` fails with INVALID. Each resolved
+material is leased (flagged secret) and zeroed when the host releases it. At most one instance; at
+most 8 KiB of settings, 1 KiB of material per lease, 16 leases outstanding.
 
 ## Build
 
