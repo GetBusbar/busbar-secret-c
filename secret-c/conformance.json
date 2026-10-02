@@ -1,0 +1,9 @@
+{
+  "secret": {
+    "settings": "{\"values\": {\"db\": \"material\"}}",
+    "bad_settings": ["[]"],
+    "known": { "resolve": "{\"name\": \"db\"}", "material": "material" },
+    "unknown": "{\"name\": \"missing\"}",
+    "malformed": "not json"
+  }
+}
