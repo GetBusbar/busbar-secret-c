@@ -15,7 +15,7 @@ Thanks for your interest in improving `busbar-secret-c`.
 Every busbar plugin repo has the same skeleton. This one is a C plugin: `secret-c/` holds its `.c`
 sources, its `conformance.json` and its declares file. It includes `busbar_plugin.h` and nothing
 else, the header taken from busbar at the commit in `.busbar-ref`. The CI, release and community
-files are rendered by `busbar-release plugin sync` from the fleet template (GetBusbar/busbar-release
+files are rendered by `busbar-release plugin heal` from the fleet template (GetBusbar/busbar-release
 `template/`) and [busbar's plugin registry](https://github.com/GetBusbar/busbar/blob/main/plugins.yaml);
 change them there, not here.
 
