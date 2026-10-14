@@ -718,14 +718,17 @@ static const bb_secret_Ops OPS = {
     op_resolve,
 };
 
+/* Designated initializers: a member the header adds later (the optional `ready` tail op) is
+ * zero, i.e. absent, and -Wmissing-field-initializers stays quiet, so this door compiles against
+ * the header at any pin. This plugin serves no `ready`. */
 static const bb_mech_Door DOOR = {
-    BB_MECH_DOOR_MAGIC,
-    BB_MECH_MECHANISM_VERSION,
-    (uint32_t)sizeof(bb_mech_Door),
-    (uint32_t)BB_MECH_KindCode_Secret,
-    BUSBAR_PLUGIN_KIND_ABI,
-    &STATEMENT,
-    (const bb_mech_OpsHead *)&OPS,
+    .magic = BB_MECH_DOOR_MAGIC,
+    .mechanism_version = BB_MECH_MECHANISM_VERSION,
+    .size = (uint32_t)sizeof(bb_mech_Door),
+    .kind = (uint32_t)BB_MECH_KindCode_Secret,
+    .kind_abi = BUSBAR_PLUGIN_KIND_ABI,
+    .statement = &STATEMENT,
+    .ops = (const bb_mech_OpsHead *)&OPS,
 };
 
 /* THE ONE SYMBOL (BB_MECH_DOOR_SYMBOL). */
