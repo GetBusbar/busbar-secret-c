@@ -25,11 +25,11 @@ jobs:
     secrets: inherit
   release:
     needs: ci
-    uses: GetBusbar/busbar/.github/workflows/plugin-release.yml@14fe4c7e0da540631fdb6291f6b8c06a55902d66
+    uses: GetBusbar/busbar/.github/workflows/plugin-release.yml@179abf2c10cf1406778300ef1f1b3964cc229727
     with:
       plugin_crate: busbar-secret-c
       manifest_name: busbar-secret-c
-      plugin_alias: c
+      plugin_alias: secret-c
       plugin_kind: secret
       asset_prefix: busbar-secret-c
       description: "First-party signed kind:secret plugin library, written in C from busbar_plugin.h alone: the c secret, packaged as a droppable busbar plugin. Drop the signed tarball into plugins/."
@@ -43,12 +43,12 @@ jobs:
   consumer-verify:
     needs: release
     if: ${{ !cancelled() }}
-    uses: GetBusbar/busbar/.github/workflows/plugin-consumer-verify.yml@14fe4c7e0da540631fdb6291f6b8c06a55902d66
+    uses: GetBusbar/busbar/.github/workflows/plugin-consumer-verify.yml@179abf2c10cf1406778300ef1f1b3964cc229727
     with:
       version: ${{ github.ref_name }}
       asset_prefix: busbar-secret-c
       plugin_name: busbar-secret-c
-      plugin_alias: c
+      plugin_alias: secret-c
       plugin_kind: secret
       bundle_image: ""
       bundle_env: ""
