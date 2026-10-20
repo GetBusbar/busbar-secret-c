@@ -699,6 +699,24 @@ static bb_mech_RawOutcome op_resolve(void *inst, const void *in, void *out) {
     return answer(&o->head, sizeof *o, BB_MECH_Outcome_Ready);
 }
 
+/* `check` (secret kind op 10): this plugin judges no reference at config time, so it answers
+ * REFUSED, "not served": every reference passes, and `resolve` judges it (the secret kind's
+ * `Ops::check` docs). The answer the SDK's unserved slot gives a Rust door that names none: a NULL
+ * or short `out` is a FAULT, a NULL `in` is a FAULT, and nothing is written beyond the outcome. */
+static bb_mech_RawOutcome op_check(void *inst, const void *in, void *out) {
+    bb_mech_OutHead *o = out;
+    (void)inst;
+    if (o == 0 || o->size < sizeof *o) {
+        return (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
+    }
+    if (in == 0) {
+        o->outcome = (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
+        return (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
+    }
+    o->outcome = (bb_mech_RawOutcome)BB_MECH_Outcome_Refused;
+    return (bb_mech_RawOutcome)BB_MECH_Outcome_Refused;
+}
+
 /* ---- the table and the door ---- */
 
 static const bb_secret_Ops OPS = {
@@ -716,6 +734,7 @@ static const bb_secret_Ops OPS = {
         op_close,
     },
     op_resolve,
+    op_check,
 };
 
 /* Designated initializers: a member the header adds later (the optional `ready` tail op) is
