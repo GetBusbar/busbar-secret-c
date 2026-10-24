@@ -20,8 +20,9 @@
  *                              the settings (at most SETTINGS_CAP bytes); `refresh` replaces it.
  *   resolve   READY with the material under a lease (octets, flagged secret); a name it does not
  *             hold FAILS with NOT_FOUND; a resolve settings blob that is not {"name": "<string>"}
- *             FAILS with INVALID.
+ *             FAILS with INVALID; an empty material FAILS with INVALID.
  *   release   READY for an outstanding lease (its material is zeroed), REFUSED for any other.
+ *   check     REFUSED ("not served"): resolve judges every reference.
  *   close     every outstanding lease is zeroed; the instance is gone.
  *   the rest of the lifecycle answers READY.
  *
@@ -438,10 +439,14 @@ static int member(struct cursor *c, const char *want_text, const uint8_t *want, 
 static const char NOT_AN_OBJECT[] = "settings must be one JSON object";
 static const char NO_VALUES[] = "settings: `values` must be an object";
 static const char NOT_STRINGS[] = "settings: every `values` entry must be a string";
+static const char TOO_LARGE[] = "settings: larger than this plugin keeps";
 
 /* Why `settings` is not this plugin's settings, or 0 when it is. */
 static const char *settings_refusal(const uint8_t *ptr, size_t len) {
     struct cursor c;
+    if (len > SETTINGS_CAP) {
+        return TOO_LARGE;
+    }
     if (!one_object(ptr, len)) {
         return NOT_AN_OBJECT;
     }
@@ -506,9 +511,6 @@ static const char *keep(struct instance *s, const bb_mech_Blob *settings) {
     size_t k;
     if (why != 0) {
         return why;
-    }
-    if (settings->len > SETTINGS_CAP) {
-        return "settings: larger than this plugin keeps";
     }
     zero(s->settings, sizeof s->settings);
     for (k = 0; k < settings->len; k++) {
@@ -639,7 +641,7 @@ static bb_mech_RawOutcome op_resolve(void *inst, const void *in, void *out) {
     bb_secret_ResolveOut *o = out;
     uint8_t name[MATERIAL_CAP];
     size_t name_len = 0, k;
-    struct cursor c;
+    struct cursor c, probe;
     struct lease *slot = 0;
     if (i->head.size < sizeof *i || o->head.size < sizeof *o) {
         return say(&o->head, sizeof *o, BB_MECH_Outcome_Refused, "resolve: short frame");
@@ -653,7 +655,15 @@ static bb_mech_RawOutcome op_resolve(void *inst, const void *in, void *out) {
     c.end = i->settings.ptr + i->settings.len;
     ws(&c);
     c.p++;
-    if (!member(&c, "name", 0, 0) || !string(&c, name, sizeof name, &name_len)) {
+    if (!member(&c, "name", 0, 0)) {
+        return resolve_failed(o, BB_SECRET_ERROR_KIND_INVALID, "resolve: `name` must be a string");
+    }
+    probe = c;
+    if (!string(&c, name, sizeof name, &name_len)) {
+        /* A well-formed string too long to be held names nothing this plugin holds. */
+        if (string(&probe, 0, 0, &name_len)) {
+            return resolve_failed(o, BB_SECRET_ERROR_KIND_NOT_FOUND, "no secret by that name");
+        }
         return resolve_failed(o, BB_SECRET_ERROR_KIND_INVALID, "resolve: `name` must be a string");
     }
     /* The instance's `values` (validated when it was kept). */
@@ -682,16 +692,14 @@ static bb_mech_RawOutcome op_resolve(void *inst, const void *in, void *out) {
         slot->len = 0;
         return resolve_failed(o, BB_SECRET_ERROR_KIND_INTERNAL, "resolve: the material is larger than a lease holds");
     }
+    if (slot->len == 0) {
+        /* Fail closed: an empty value is an error, never an empty success. The slot stays free. */
+        return resolve_failed(o, BB_SECRET_ERROR_KIND_INVALID,
+                              "resolve: the material is empty; a secret must be non-empty");
+    }
     o->error_kind = BB_SECRET_ERROR_KIND_UNSET;
     o->secret.fmt = BB_MECH_BLOB_OCTETS;
     o->secret.flags = BB_MECH_BLOB_SECRET;
-    if (slot->len == 0) {
-        /* Empty material: nothing to lease. */
-        o->secret.ptr = 0;
-        o->secret.len = 0;
-        o->head.lease = 0;
-        return answer(&o->head, sizeof *o, BB_MECH_Outcome_Ready);
-    }
     slot->id = s->next_lease++;
     o->secret.ptr = slot->material;
     o->secret.len = slot->len;
@@ -720,26 +728,24 @@ static bb_mech_RawOutcome op_check(void *inst, const void *in, void *out) {
 /* ---- the table and the door ---- */
 
 static const bb_secret_Ops OPS = {
-    {
-        (uint32_t)sizeof(bb_secret_Ops),
-        BB_SECRET_SLOTS,
-        op_validate,
-        op_open,
-        op_refresh,
-        op_ready, /* retire */
-        op_tick,
-        op_ready, /* drive */
-        op_cancel,
-        op_release,
-        op_close,
-    },
-    op_resolve,
-    op_check,
+    .head = { .size = (uint32_t)sizeof(bb_secret_Ops),
+              .slots = BB_SECRET_SLOTS,
+              .validate = op_validate,
+              .open = op_open,
+              .refresh = op_refresh,
+              .retire = op_ready,
+              .tick = op_tick,
+              .drive = op_ready,
+              .cancel = op_cancel,
+              .release = op_release,
+              .close = op_close },
+    .resolve = op_resolve,
+    .check = op_check,
 };
 
-/* Designated initializers: a member the header adds later (the optional `ready` tail op) is
- * zero, i.e. absent, and -Wmissing-field-initializers stays quiet, so this door compiles against
- * the header at any pin. This plugin serves no `ready`. */
+/* Designated initializers (here and in OPS): a member the header adds later (the optional `ready`
+ * tail op, a further secret op) is zero, i.e. absent, and -Wmissing-field-initializers stays quiet,
+ * so this door compiles against the header at any pin. This plugin serves no `ready`. */
 static const bb_mech_Door DOOR = {
     .magic = BB_MECH_DOOR_MAGIC,
     .mechanism_version = BB_MECH_MECHANISM_VERSION,

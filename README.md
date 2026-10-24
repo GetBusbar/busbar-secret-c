@@ -28,7 +28,8 @@ Configured under the `c` module name. The instance's settings name each secret a
 ```
 
 A secret reference's settings name one of them: `{"name": "db"}`. A name it does not hold fails
-with NOT_FOUND; a reference that is not `{"name": "<string>"}` fails with INVALID. Each resolved
+with NOT_FOUND; a reference that is not `{"name": "<string>"}` fails with INVALID; an empty
+material fails with INVALID. Each resolved
 material is leased (flagged secret) and zeroed when the host releases it. At most one instance; at
 most 8 KiB of settings, 1 KiB of material per lease, 16 leases outstanding.
 
