@@ -20,7 +20,7 @@
  *                              the settings (at most SETTINGS_CAP bytes); `refresh` replaces it.
  *   resolve   READY with the material under a lease (octets, flagged secret); a name it does not
  *             hold FAILS with NOT_FOUND; a resolve settings blob that is not {"name": "<string>"}
- *             FAILS with INVALID.
+ *             FAILS with INVALID; an empty material FAILS with INVALID.
  *   release   READY for an outstanding lease (its material is zeroed), REFUSED for any other.
  *   close     every outstanding lease is zeroed; the instance is gone.
  *   the rest of the lifecycle answers READY.
@@ -691,16 +691,14 @@ static bb_mech_RawOutcome op_resolve(void *inst, const void *in, void *out) {
         slot->len = 0;
         return resolve_failed(o, BB_SECRET_ERROR_KIND_INTERNAL, "resolve: the material is larger than a lease holds");
     }
+    if (slot->len == 0) {
+        /* Fail closed: an empty value is an error, never an empty success. The slot stays free. */
+        return resolve_failed(o, BB_SECRET_ERROR_KIND_INVALID,
+                              "resolve: the material is empty; a secret must be non-empty");
+    }
     o->error_kind = BB_SECRET_ERROR_KIND_UNSET;
     o->secret.fmt = BB_MECH_BLOB_OCTETS;
     o->secret.flags = BB_MECH_BLOB_SECRET;
-    if (slot->len == 0) {
-        /* Empty material: nothing to lease. */
-        o->secret.ptr = 0;
-        o->secret.len = 0;
-        o->head.lease = 0;
-        return answer(&o->head, sizeof *o, BB_MECH_Outcome_Ready);
-    }
     slot->id = s->next_lease++;
     o->secret.ptr = slot->material;
     o->secret.len = slot->len;
