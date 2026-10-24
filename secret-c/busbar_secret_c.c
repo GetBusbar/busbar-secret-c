@@ -22,6 +22,7 @@
  *             hold FAILS with NOT_FOUND; a resolve settings blob that is not {"name": "<string>"}
  *             FAILS with INVALID; an empty material FAILS with INVALID.
  *   release   READY for an outstanding lease (its material is zeroed), REFUSED for any other.
+ *   check     REFUSED ("not served"): resolve judges every reference.
  *   close     every outstanding lease is zeroed; the instance is gone.
  *   the rest of the lifecycle answers READY.
  *
@@ -727,26 +728,24 @@ static bb_mech_RawOutcome op_check(void *inst, const void *in, void *out) {
 /* ---- the table and the door ---- */
 
 static const bb_secret_Ops OPS = {
-    {
-        (uint32_t)sizeof(bb_secret_Ops),
-        BB_SECRET_SLOTS,
-        op_validate,
-        op_open,
-        op_refresh,
-        op_ready, /* retire */
-        op_tick,
-        op_ready, /* drive */
-        op_cancel,
-        op_release,
-        op_close,
-    },
-    op_resolve,
-    op_check,
+    .head = { .size = (uint32_t)sizeof(bb_secret_Ops),
+              .slots = BB_SECRET_SLOTS,
+              .validate = op_validate,
+              .open = op_open,
+              .refresh = op_refresh,
+              .retire = op_ready,
+              .tick = op_tick,
+              .drive = op_ready,
+              .cancel = op_cancel,
+              .release = op_release,
+              .close = op_close },
+    .resolve = op_resolve,
+    .check = op_check,
 };
 
-/* Designated initializers: a member the header adds later (the optional `ready` tail op) is
- * zero, i.e. absent, and -Wmissing-field-initializers stays quiet, so this door compiles against
- * the header at any pin. This plugin serves no `ready`. */
+/* Designated initializers (here and in OPS): a member the header adds later (the optional `ready`
+ * tail op, a further secret op) is zero, i.e. absent, and -Wmissing-field-initializers stays quiet,
+ * so this door compiles against the header at any pin. This plugin serves no `ready`. */
 static const bb_mech_Door DOOR = {
     .magic = BB_MECH_DOOR_MAGIC,
     .mechanism_version = BB_MECH_MECHANISM_VERSION,
