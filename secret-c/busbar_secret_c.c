@@ -640,7 +640,7 @@ static bb_mech_RawOutcome op_resolve(void *inst, const void *in, void *out) {
     bb_secret_ResolveOut *o = out;
     uint8_t name[MATERIAL_CAP];
     size_t name_len = 0, k;
-    struct cursor c;
+    struct cursor c, probe;
     struct lease *slot = 0;
     if (i->head.size < sizeof *i || o->head.size < sizeof *o) {
         return say(&o->head, sizeof *o, BB_MECH_Outcome_Refused, "resolve: short frame");
@@ -654,7 +654,15 @@ static bb_mech_RawOutcome op_resolve(void *inst, const void *in, void *out) {
     c.end = i->settings.ptr + i->settings.len;
     ws(&c);
     c.p++;
-    if (!member(&c, "name", 0, 0) || !string(&c, name, sizeof name, &name_len)) {
+    if (!member(&c, "name", 0, 0)) {
+        return resolve_failed(o, BB_SECRET_ERROR_KIND_INVALID, "resolve: `name` must be a string");
+    }
+    probe = c;
+    if (!string(&c, name, sizeof name, &name_len)) {
+        /* A well-formed string too long to be held names nothing this plugin holds. */
+        if (string(&probe, 0, 0, &name_len)) {
+            return resolve_failed(o, BB_SECRET_ERROR_KIND_NOT_FOUND, "no secret by that name");
+        }
         return resolve_failed(o, BB_SECRET_ERROR_KIND_INVALID, "resolve: `name` must be a string");
     }
     /* The instance's `values` (validated when it was kept). */
