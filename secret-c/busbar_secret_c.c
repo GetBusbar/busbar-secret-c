@@ -438,10 +438,14 @@ static int member(struct cursor *c, const char *want_text, const uint8_t *want, 
 static const char NOT_AN_OBJECT[] = "settings must be one JSON object";
 static const char NO_VALUES[] = "settings: `values` must be an object";
 static const char NOT_STRINGS[] = "settings: every `values` entry must be a string";
+static const char TOO_LARGE[] = "settings: larger than this plugin keeps";
 
 /* Why `settings` is not this plugin's settings, or 0 when it is. */
 static const char *settings_refusal(const uint8_t *ptr, size_t len) {
     struct cursor c;
+    if (len > SETTINGS_CAP) {
+        return TOO_LARGE;
+    }
     if (!one_object(ptr, len)) {
         return NOT_AN_OBJECT;
     }
@@ -506,9 +510,6 @@ static const char *keep(struct instance *s, const bb_mech_Blob *settings) {
     size_t k;
     if (why != 0) {
         return why;
-    }
-    if (settings->len > SETTINGS_CAP) {
-        return "settings: larger than this plugin keeps";
     }
     zero(s->settings, sizeof s->settings);
     for (k = 0; k < settings->len; k++) {
