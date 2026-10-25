@@ -15,12 +15,15 @@
  *   resolve settings  {"name": "<name>"}
  *
  * Per op of the secret table:
- *   validate / open / refresh  the settings must be one JSON object whose `values` is an object of
- *                              strings; anything else FAILS naming why. `open` keeps a copy of
- *                              the settings (at most SETTINGS_CAP bytes); `refresh` replaces it.
+ *   validate / open / refresh  the settings must be one JSON object whose one setting is `values`,
+ *                              an object of non-empty strings of at most MATERIAL_CAP bytes each;
+ *                              anything else FAILS naming why, the same at all three. `open` keeps
+ *                              a copy of the settings (at most SETTINGS_CAP bytes); `refresh`
+ *                              replaces it.
  *   resolve   READY with the material under a lease (octets, flagged secret); a name it does not
- *             hold FAILS with NOT_FOUND; a resolve settings blob that is not {"name": "<string>"}
- *             FAILS with INVALID; an empty material FAILS with INVALID.
+ *             hold FAILS with NOT_FOUND; a resolve settings blob that is not {"name": "<non-empty
+ *             string>"} (another setting included) FAILS with INVALID; an empty material FAILS
+ *             with INVALID.
  *   release   READY for an outstanding lease (its material is zeroed), REFUSED for any other.
  *   check     REFUSED ("not served"): resolve judges every reference.
  *   close     every outstanding lease is zeroed; the instance is gone.
@@ -30,9 +33,16 @@
  * Statement state. busbar's C conformance builds this source again with another value (its RED
  * arm): the loader must refuse that build.
  *
- * At most one instance (MARK_ONE_INSTANCE): its state is static.
+ * At most one instance (MARK_ONE_INSTANCE): its state is static, and every op that reads or writes
+ * it (open, refresh, resolve, release, close) holds THE instance lock, so a `refresh` the host runs
+ * beside a `resolve` never lets it read half-replaced settings. The lock is a ticket lock on C11
+ * `_Atomic` counters (a language feature: no header, no libc).
  */
 #include "busbar_plugin.h"
+
+#if defined(__STDC_NO_ATOMICS__)
+#error "busbar-secret-c needs C11 _Atomic for its instance lock"
+#endif
 
 #ifndef BUSBAR_PLUGIN_KIND_ABI
 #define BUSBAR_PLUGIN_KIND_ABI BB_SECRET_ABI_VERSION
@@ -83,6 +93,21 @@ struct instance {
 };
 
 static struct instance THE_INSTANCE;
+
+/* THE instance lock: a ticket lock. `++` on an `_Atomic` object is one atomic read-modify-write
+ * and a read of one is an atomic load (C11 6.5.2.4, 6.2.6.1), both sequentially consistent. */
+static _Atomic unsigned long NEXT_TICKET;
+static _Atomic unsigned long SERVING;
+
+static void lock(void) {
+    unsigned long mine = NEXT_TICKET++;
+    while (SERVING != mine) {
+    }
+}
+
+static void unlock(void) {
+    SERVING++;
+}
 
 /* ---- helpers: no libc ---- */
 
@@ -438,10 +463,53 @@ static int member(struct cursor *c, const char *want_text, const uint8_t *want, 
 
 static const char NOT_AN_OBJECT[] = "settings must be one JSON object";
 static const char NO_VALUES[] = "settings: `values` must be an object";
+static const char ONLY_VALUES[] = "settings: `values` is the only setting";
 static const char NOT_STRINGS[] = "settings: every `values` entry must be a string";
+static const char EMPTY_VALUE[] = "settings: a `values` entry is empty; a secret must be non-empty";
+static const char VALUE_TOO_LARGE[] =
+    "settings: a `values` entry is larger than a lease holds (1024 bytes)";
 static const char TOO_LARGE[] = "settings: larger than this plugin keeps";
 
-/* Why `settings` is not this plugin's settings, or 0 when it is. */
+/* Why the `values` object at the cursor (on its `{`) is not one this plugin serves, or 0; the
+ * cursor ends past its `}`. Every entry is judged here, so `resolve` never meets a value it
+ * cannot lease: an empty one, or one larger than a lease holds. */
+static const char *values_refusal(struct cursor *c) {
+    c->p++;
+    ws(c);
+    if (c->p < c->end && *c->p == '}') {
+        c->p++;
+        return 0;
+    }
+    for (;;) {
+        size_t n;
+        ws(c);
+        if (!string(c, 0, 0, &n)) {
+            return NOT_STRINGS;
+        }
+        ws(c);
+        c->p++; /* ':' */
+        ws(c);
+        if (c->p >= c->end || *c->p != '"' || !string(c, 0, 0, &n)) {
+            return NOT_STRINGS;
+        }
+        if (n == 0) {
+            return EMPTY_VALUE;
+        }
+        if (n > MATERIAL_CAP) {
+            return VALUE_TOO_LARGE;
+        }
+        ws(c);
+        if (c->p < c->end && *c->p == ',') {
+            c->p++;
+            continue;
+        }
+        c->p++; /* '}' (the object is well formed) */
+        return 0;
+    }
+}
+
+/* Why `settings` is not this plugin's settings, or 0 when it is: one object whose one setting is
+ * `values`; any other setting is refused, never ignored. */
 static const char *settings_refusal(const uint8_t *ptr, size_t len) {
     struct cursor c;
     if (len > SETTINGS_CAP) {
@@ -454,25 +522,25 @@ static const char *settings_refusal(const uint8_t *ptr, size_t len) {
     c.end = ptr + len;
     ws(&c);
     c.p++;
-    if (!member(&c, "values", 0, 0) || c.p >= c.end || *c.p != '{') {
-        return NO_VALUES;
-    }
-    c.p++;
     ws(&c);
     if (c.p < c.end && *c.p == '}') {
-        return 0;
+        return NO_VALUES;
     }
     for (;;) {
-        size_t n;
+        const char *why;
         ws(&c);
-        if (!string(&c, 0, 0, &n)) {
-            return NOT_STRINGS;
+        if (key_is(&c, (const uint8_t *)"values", 6) != 1) {
+            return ONLY_VALUES;
         }
         ws(&c);
         c.p++; /* ':' */
         ws(&c);
-        if (c.p >= c.end || *c.p != '"' || !string(&c, 0, 0, &n)) {
-            return NOT_STRINGS;
+        if (c.p >= c.end || *c.p != '{') {
+            return NO_VALUES;
+        }
+        why = values_refusal(&c);
+        if (why != 0) {
+            return why;
         }
         ws(&c);
         if (c.p < c.end && *c.p == ',') {
@@ -480,6 +548,36 @@ static const char *settings_refusal(const uint8_t *ptr, size_t len) {
             continue;
         }
         return 0;
+    }
+}
+
+/* Whether every member of the well-formed object `ptr[0..len]` is named `want`. */
+static int only_member(const uint8_t *ptr, size_t len, const char *want) {
+    struct cursor c;
+    c.p = ptr;
+    c.end = ptr + len;
+    ws(&c);
+    c.p++;
+    ws(&c);
+    if (c.p < c.end && *c.p == '}') {
+        return 1;
+    }
+    for (;;) {
+        ws(&c);
+        if (key_is(&c, (const uint8_t *)want, length(want)) != 1) {
+            return 0;
+        }
+        ws(&c);
+        c.p++; /* ':' */
+        if (!value(&c, 1)) {
+            return 0;
+        }
+        ws(&c);
+        if (c.p < c.end && *c.p == ',') {
+            c.p++;
+            continue;
+        }
+        return 1;
     }
 }
 
@@ -529,7 +627,7 @@ static void drop_leases(struct instance *s) {
     }
 }
 
-static bb_mech_RawOutcome op_open(void *inst, const void *in, void *out) {
+static bb_mech_RawOutcome op_open_held(void *inst, const void *in, void *out) {
     const bb_mech_OpenIn *i = in;
     bb_mech_OpenOut *o = out;
     const char *why;
@@ -553,7 +651,7 @@ static bb_mech_RawOutcome op_open(void *inst, const void *in, void *out) {
     return answer(&o->head, sizeof *o, BB_MECH_Outcome_Ready);
 }
 
-static bb_mech_RawOutcome op_refresh(void *inst, const void *in, void *out) {
+static bb_mech_RawOutcome op_refresh_held(void *inst, const void *in, void *out) {
     struct instance *s = inst;
     const bb_mech_RefreshIn *r = in;
     bb_mech_OutHead *o = out;
@@ -594,7 +692,7 @@ static bb_mech_RawOutcome op_cancel(void *inst, const void *in, void *out) {
     return answer(&o->head, sizeof *o, BB_MECH_Outcome_Ready);
 }
 
-static bb_mech_RawOutcome op_release(void *inst, const void *in, void *out) {
+static bb_mech_RawOutcome op_release_held(void *inst, const void *in, void *out) {
     struct instance *s = inst;
     const bb_mech_ReleaseIn *r = in;
     bb_mech_OutHead *o = out;
@@ -616,7 +714,7 @@ static bb_mech_RawOutcome op_release(void *inst, const void *in, void *out) {
     return say(o, sizeof *o, BB_MECH_Outcome_Refused, "no such lease");
 }
 
-static bb_mech_RawOutcome op_close(void *inst, const void *in, void *out) {
+static bb_mech_RawOutcome op_close_held(void *inst, const void *in, void *out) {
     struct instance *s = inst;
     (void)in;
     drop_leases(s);
@@ -635,7 +733,7 @@ static bb_mech_RawOutcome resolve_failed(bb_secret_ResolveOut *o, uint32_t kind,
     return say(&o->head, sizeof *o, BB_MECH_Outcome_Failed, text);
 }
 
-static bb_mech_RawOutcome op_resolve(void *inst, const void *in, void *out) {
+static bb_mech_RawOutcome op_resolve_held(void *inst, const void *in, void *out) {
     struct instance *s = inst;
     const bb_secret_ResolveIn *i = in;
     bb_secret_ResolveOut *o = out;
@@ -658,6 +756,10 @@ static bb_mech_RawOutcome op_resolve(void *inst, const void *in, void *out) {
     if (!member(&c, "name", 0, 0)) {
         return resolve_failed(o, BB_SECRET_ERROR_KIND_INVALID, "resolve: `name` must be a string");
     }
+    if (!only_member(i->settings.ptr, i->settings.len, "name")) {
+        return resolve_failed(o, BB_SECRET_ERROR_KIND_INVALID,
+                              "resolve: a reference names only `name`");
+    }
     probe = c;
     if (!string(&c, name, sizeof name, &name_len)) {
         /* A well-formed string too long to be held names nothing this plugin holds. */
@@ -665,6 +767,10 @@ static bb_mech_RawOutcome op_resolve(void *inst, const void *in, void *out) {
             return resolve_failed(o, BB_SECRET_ERROR_KIND_NOT_FOUND, "no secret by that name");
         }
         return resolve_failed(o, BB_SECRET_ERROR_KIND_INVALID, "resolve: `name` must be a string");
+    }
+    if (name_len == 0) {
+        return resolve_failed(o, BB_SECRET_ERROR_KIND_INVALID,
+                              "resolve: `name` must be a non-empty string");
     }
     /* The instance's `values` (validated when it was kept). */
     c.p = s->settings;
@@ -690,7 +796,8 @@ static bb_mech_RawOutcome op_resolve(void *inst, const void *in, void *out) {
     if (!string(&c, slot->material, sizeof slot->material, &slot->len)) {
         zero(slot->material, sizeof slot->material);
         slot->len = 0;
-        return resolve_failed(o, BB_SECRET_ERROR_KIND_INTERNAL, "resolve: the material is larger than a lease holds");
+        return resolve_failed(o, BB_SECRET_ERROR_KIND_INVALID,
+                              "resolve: the material is larger than a lease holds");
     }
     if (slot->len == 0) {
         /* Fail closed: an empty value is an error, never an empty success. The slot stays free. */
@@ -724,6 +831,23 @@ static bb_mech_RawOutcome op_check(void *inst, const void *in, void *out) {
     o->outcome = (bb_mech_RawOutcome)BB_MECH_Outcome_Refused;
     return (bb_mech_RawOutcome)BB_MECH_Outcome_Refused;
 }
+
+/* ---- the ops that touch the instance, under its lock ---- */
+
+#define HELD(op)                                                                                   \
+    static bb_mech_RawOutcome op(void *inst, const void *in, void *out) {                          \
+        bb_mech_RawOutcome r;                                                                      \
+        lock();                                                                                    \
+        r = op##_held(inst, in, out);                                                              \
+        unlock();                                                                                  \
+        return r;                                                                                  \
+    }
+
+HELD(op_open)
+HELD(op_refresh)
+HELD(op_release)
+HELD(op_close)
+HELD(op_resolve)
 
 /* ---- the table and the door ---- */
 
