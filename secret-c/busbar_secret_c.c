@@ -2,12 +2,11 @@
  * SPDX-License-Identifier: Apache-2.0
  * Copyright (C) 2026 Busbar Inc and contributors
  *
- * busbar-secret-c: a busbar SECRET plugin written in C from the generated header ALONE
- * (BUSBAR-1.6.0.md decision #84, THE DESIGN section 11.5: "the generated C header is the only
- * artifact an author needs"). It includes busbar_plugin.h and nothing else: no Rust, no busbar
- * crate, no libc header, no allocator. busbar's plugin-ci.yml compiles it with the system C compiler
- * against the header at this repo's busbar pin and loads the library through the loader's one
- * dropped-in path (`load_dropped`), then drives the secret kind's conformance script over it.
+ * busbar-secret-c: a busbar SECRET plugin written in C from the generated header ALONE. It
+ * includes busbar_plugin.h and nothing else: no Rust, no busbar crate, no libc header, no
+ * allocator. busbar's plugin-ci.yml compiles it with the system C compiler against the header at
+ * this repo's busbar pin and loads the library through the loader's dropped-in path
+ * (`load_dropped`), then drives the secret kind's conformance script over it.
  *
  * What it serves: named secrets whose material is written in its own settings.
  *
@@ -30,11 +29,11 @@
  *   the rest of the lifecycle answers READY.
  *
  * BUSBAR_PLUGIN_KIND_ABI (default BB_SECRET_ABI_VERSION) is the kind ABI the door and its
- * Statement state. busbar's C conformance builds this source again with another value (its RED
- * arm): the loader must refuse that build.
+ * Statement state. busbar's C conformance builds this source again with another value: the
+ * loader must refuse that build.
  *
  * At most one instance (MARK_ONE_INSTANCE): its state is static, and every op that reads or writes
- * it (open, refresh, resolve, release, close) holds THE instance lock, so a `refresh` the host runs
+ * it (open, refresh, resolve, release, close) holds the instance lock, so a `refresh` the host runs
  * beside a `resolve` never lets it read half-replaced settings. The lock is a ticket lock on C11
  * `_Atomic` counters (a language feature: no header, no libc).
  */
