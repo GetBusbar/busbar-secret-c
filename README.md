@@ -32,9 +32,10 @@ at `validate`, `open` and `refresh` alike.
 
 A secret reference's settings name one of them: `{"name": "db"}`. A name it does not hold fails
 with NOT_FOUND; a reference that is not `{"name": "<non-empty string>"}`, or that names another
-setting, fails with INVALID. Each resolved material is leased (flagged secret) and zeroed when
-the host releases it. At most one instance, whose ops hold one lock (a `refresh` never races a
-`resolve`); at most 8 KiB of settings, 1 KiB of material per lease, 16 leases outstanding.
+setting, fails with INVALID. A resolved material is decoded straight into the host's buffer
+(flagged secret) under no lease, and the plugin keeps no copy of it; a material over that buffer
+gets the short-buffer answer. At most one instance, whose ops hold one lock (a `refresh` never
+races a `resolve`); at most 8 KiB of settings and 1 KiB of material per name.
 
 ## Build
 
@@ -56,15 +57,15 @@ refused). Locally, from a busbar checkout at the pin:
 ```bash
 BUSBAR_DROPPED_LIB=$PWD/libbusbar_secret_c.so BUSBAR_DROPPED_SOURCES=$PWD/secret-c \
 BUSBAR_DROPPED_SCRIPT=$PWD/secret-c/conformance.json \
-  cargo test --manifest-path <busbar>/Cargo.toml --locked -p busbar-plugin-loader \
-  --test dropped_conformance -- --ignored
+  cargo run --manifest-path <busbar>/Cargo.toml --locked -p busbar-test-kit \
+  --example dropped_conformance
 ```
 
 The unit tests (`secret-c/tests/unit.c`, not part of the plugin) drive the door directly for
 what the conformance script does not judge, under ThreadSanitizer:
 
 ```bash
-cc -std=c11 -Wall -Wextra -Werror -pedantic -fsanitize=thread -g \
+cc -std=c11 -Wall -Wextra -Werror -pedantic -fsanitize=thread -g -DBUSBAR_SECRET_C_UNIT \
   -I <busbar>/crates/busbar-contract/include -o /tmp/secret-c-unit \
   secret-c/busbar_secret_c.c secret-c/tests/unit.c -lpthread && /tmp/secret-c-unit
 ```

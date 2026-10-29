@@ -857,7 +857,9 @@ static const bb_secret_Ops OPS = {
 
 /* Designated initializers (here and in OPS): a member the header adds later (the optional `ready`
  * tail op, a further secret op) is zero, i.e. absent, and -Wmissing-field-initializers stays quiet,
- * so this door compiles against the header at any pin. This plugin serves no `ready`. */
+ * so this door compiles against the header at any pin. This plugin serves no `ready` and no
+ * `migrate`. `layout` states the secret kind's layout fingerprint (the fold of the kind's table and
+ * records this source was built against): the loader refuses a door whose fingerprint is not its own. */
 static const bb_mech_Door DOOR = {
     .magic = BB_MECH_DOOR_MAGIC,
     .mechanism_version = BB_MECH_MECHANISM_VERSION,
@@ -866,7 +868,10 @@ static const bb_mech_Door DOOR = {
     .kind_abi = BUSBAR_PLUGIN_KIND_ABI,
     .statement = &STATEMENT,
     .ops = (const bb_mech_OpsHead *)&OPS,
+    .layout = BB_SECRET_LAYOUT_FINGERPRINT,
 };
+_Static_assert(offsetof(bb_mech_Door, layout) == 56 && sizeof(bb_mech_Door) == 64,
+               "the door states its layout fingerprint at offset 56 of a 64-byte door");
 
 #ifdef BUSBAR_SECRET_C_UNIT
 /* TEST ONLY (tests/unit.c, never in a plugin build): the one instance's memory, so a unit case can
