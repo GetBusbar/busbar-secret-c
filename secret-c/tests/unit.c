@@ -9,13 +9,14 @@
  *
  * Run (from the repo root, with busbar_plugin.h from busbar at .busbar-ref):
  *
- *   cc -std=c11 -Wall -Wextra -Werror -pedantic -fsanitize=thread -g \
+ *   cc -std=c11 -Wall -Wextra -Werror -pedantic -fsanitize=thread -g -DBUSBAR_SECRET_C_UNIT \
  *     -I <busbar>/crates/busbar-contract/include \
  *     -o /tmp/secret-c-unit secret-c/busbar_secret_c.c secret-c/tests/unit.c -lpthread
  *   /tmp/secret-c-unit
  *
  * It exits 0 when every case passes. Under -fsanitize=thread, a data race between `refresh` and
- * `resolve` (the race the instance lock closes) is reported and fails the run.
+ * `resolve` (the race the instance lock closes) is reported and fails the run. BUSBAR_SECRET_C_UNIT
+ * exposes the one instance's memory to this file, so a case can prove what it holds.
  */
 #define _POSIX_C_SOURCE 200809L
 #include "busbar_plugin.h"
@@ -25,6 +26,7 @@
 #include <string.h>
 
 const bb_mech_Door *busbar_plugin_door(void);
+const void *busbar_secret_c_instance(size_t *len);
 
 static int failures;
 
@@ -118,24 +120,108 @@ static void close_instance(void *inst) {
     head_ops()->close(inst, 0, &out);
 }
 
-/* resolve: the outcome, its error kind and text; a READY lease is released. */
-static int resolve(void *inst, const char *settings, uint32_t *kind, char *why, size_t cap) {
+/* resolve into the host's buffer `buf` (`buf_cap` bytes): the `out`, its error text in `why`. */
+static bb_secret_ResolveOut resolve_into(void *inst, const char *settings, uint8_t *buf,
+                                         size_t buf_cap, char *why, size_t cap) {
     bb_secret_ResolveIn in;
     bb_secret_ResolveOut out;
     memset(&in, 0, sizeof in);
     memset(&out, 0, sizeof out);
     in.head.size = sizeof in;
     in.settings = blob(settings);
+    in.secret_buf = buf;
+    in.secret_cap = buf_cap;
     out.head.size = sizeof out;
     secret_ops()->resolve(inst, &in, &out);
-    *kind = out.error_kind;
     why[0] = 0;
-    if (out.head.outcome == BB_MECH_Outcome_Ready) {
-        release(inst, out.head.lease);
-    } else if (out.head.error.ptr != 0) {
+    if (out.head.outcome != BB_MECH_Outcome_Ready && out.head.error.ptr != 0) {
         snprintf(why, cap, "%.*s", (int)out.head.error.len, (const char *)out.head.error.ptr);
     }
+    if (out.head.outcome == BB_MECH_Outcome_Ready && out.head.lease != 0) {
+        /* A plugin that still leases: hand it back, as a host would. */
+        release(inst, out.head.lease);
+    }
+    return out;
+}
+
+/* resolve: the outcome, its error kind and text (the host's buffer wiped after). */
+static int resolve(void *inst, const char *settings, uint32_t *kind, char *why, size_t cap) {
+    uint8_t buf[BB_SECRET_FIRST_SECRET_CAP];
+    bb_secret_ResolveOut out = resolve_into(inst, settings, buf, sizeof buf, why, cap);
+    memset(buf, 0, sizeof buf);
+    *kind = out.error_kind;
     return out.head.outcome;
+}
+
+/* How many times `needle` occurs in the plugin's one instance's memory. */
+static int held_copies(const char *needle) {
+    size_t len, n = strlen(needle), k;
+    const uint8_t *mem = busbar_secret_c_instance(&len);
+    int copies = 0;
+    for (k = 0; k + n <= len; k++) {
+        if (memcmp(mem + k, needle, n) == 0) {
+            copies++;
+        }
+    }
+    return copies;
+}
+
+#define CANARY "ZEROIZE-CANARY-c-7f3e"
+
+/* THE CREDENTIAL CHIP, ROW 6 (host-owned secret bytes): a READY resolve writes the value into the
+ * HOST'S buffer under no lease, and the plugin keeps no copy of it: its one instance holds the value
+ * only where its settings name it, and nothing once it is closed. RED while resolve copied the value
+ * into a lease of its own. */
+static void a_resolve_leaves_no_copy_behind(void) {
+    char why[256];
+    uint8_t buf[64];
+    bb_secret_ResolveOut out;
+    void *inst = open_instance("{\"values\": {\"db\": \"" CANARY "\"}}");
+    CHECK(inst != 0, "opens");
+    if (inst == 0) {
+        return;
+    }
+    CHECK(held_copies(CANARY) == 1, "the settings hold the value once: %d", held_copies(CANARY));
+    memset(buf, 0, sizeof buf);
+    out = resolve_into(inst, "{\"name\": \"db\"}", buf, sizeof buf, why, sizeof why);
+    CHECK(out.head.outcome == BB_MECH_Outcome_Ready, "a known name resolves: %s", why);
+    CHECK(out.head.lease == 0, "no lease: the value is the host's (lease %llu)",
+          (unsigned long long)out.head.lease);
+    CHECK(out.secret.ptr == buf && out.secret.len == strlen(CANARY) &&
+              memcmp(buf, CANARY, strlen(CANARY)) == 0,
+          "the value is written at the start of the host's buffer");
+    CHECK(out.secret.flags == BB_MECH_BLOB_SECRET, "flagged secret");
+    CHECK(held_copies(CANARY) == 1, "resolve left a copy in the plugin: %d copies",
+          held_copies(CANARY));
+    memset(buf, 0, sizeof buf);
+    close_instance(inst);
+    CHECK(held_copies(CANARY) == 0, "close wiped the settings: %d copies", held_copies(CANARY));
+}
+
+/* A value over the host's buffer is the short-buffer answer: FAILED, `needed` its full length,
+ * nothing written, no error kind; a buffer that size then resolves it. */
+static void a_value_over_the_buffer_is_the_short_answer(void) {
+    char why[256];
+    uint8_t buf[64];
+    size_t n = strlen(CANARY);
+    bb_secret_ResolveOut out;
+    void *inst = open_instance("{\"values\": {\"db\": \"" CANARY "\"}}");
+    CHECK(inst != 0, "opens");
+    if (inst == 0) {
+        return;
+    }
+    memset(buf, 0, sizeof buf);
+    out = resolve_into(inst, "{\"name\": \"db\"}", buf, n - 1, why, sizeof why);
+    CHECK(out.head.outcome == BB_MECH_Outcome_Failed && out.needed == n &&
+              out.error_kind == BB_SECRET_ERROR_KIND_UNSET && out.secret.ptr == 0,
+          "short: outcome %u needed %llu kind %u", out.head.outcome,
+          (unsigned long long)out.needed, out.error_kind);
+    CHECK(buf[0] == 0, "a short answer writes nothing");
+    out = resolve_into(inst, "{\"name\": \"db\"}", buf, n, why, sizeof why);
+    CHECK(out.head.outcome == BB_MECH_Outcome_Ready && out.secret.len == n,
+          "the re-call with the size it named resolves");
+    memset(buf, 0, sizeof buf);
+    close_instance(inst);
 }
 
 static char big_value[2200];
@@ -222,6 +308,8 @@ static void refresh_and_resolve_do_not_race(void) {
 }
 
 int main(void) {
+    a_resolve_leaves_no_copy_behind();
+    a_value_over_the_buffer_is_the_short_answer();
     settings_are_judged_whole();
     references_name_only_a_non_empty_name();
     refresh_and_resolve_do_not_race();
