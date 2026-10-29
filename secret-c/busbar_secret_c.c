@@ -19,13 +19,21 @@
  *                              anything else FAILS naming why, the same at all three. `open` keeps
  *                              a copy of the settings (at most SETTINGS_CAP bytes); `refresh`
  *                              replaces it.
- *   resolve   READY with the material under a lease (octets, flagged secret); a name it does not
- *             hold FAILS with NOT_FOUND; a resolve settings blob that is not {"name": "<non-empty
- *             string>"} (another setting included) FAILS with INVALID; an empty material FAILS
- *             with INVALID.
- *   release   READY for an outstanding lease (its material is zeroed), REFUSED for any other.
+ *   resolve   READY with the material decoded straight into the HOST'S buffer (`secret_buf`,
+ *             octets, flagged secret) under no lease: the plugin keeps no copy of what it
+ *             answers (the credential chip, row 6: host-owned secret bytes). A material over the
+ *             host's buffer is the short-buffer answer (FAILED, `needed` its length, nothing
+ *             written); the host re-calls with a buffer that size. A name it does not hold FAILS
+ *             with NOT_FOUND; a resolve settings blob that is not {"name": "<non-empty string>"}
+ *             (another setting included) FAILS with INVALID; an empty material FAILS with INVALID.
+ *   release   REFUSED: no lease is ever granted.
  *   check     REFUSED ("not served"): resolve judges every reference.
- *   close     every outstanding lease is zeroed; the instance is gone.
+ *   close     the kept settings (the only copy of the material it serves) are zeroed; the
+ *             instance is gone.
+ *
+ * WHAT IT HOLDS: the material lives in the instance's kept settings, zeroed (volatile writes) when
+ * a `refresh` replaces them and when it is closed. A resolve decodes into the host's buffer
+ * byte by byte; the few bytes of decoding scratch on its stack are zeroed before it returns.
  *   the rest of the lifecycle answers READY.
  *
  * BUSBAR_PLUGIN_KIND_ABI (default BB_SECRET_ABI_VERSION) is the kind ABI the door and its
@@ -33,7 +41,7 @@
  * loader must refuse that build.
  *
  * At most one instance (MARK_ONE_INSTANCE): its state is static, and every op that reads or writes
- * it (open, refresh, resolve, release, close) holds the instance lock, so a `refresh` the host runs
+ * it (open, refresh, resolve, close) holds the instance lock, so a `refresh` the host runs
  * beside a `resolve` never lets it read half-replaced settings. The lock is a ticket lock on C11
  * `_Atomic` counters (a language feature: no header, no libc).
  */
@@ -55,11 +63,9 @@
 
 #define STR(s) { (const uint8_t *)(s), sizeof(s) - 1 }
 
-/* The largest settings blob `open` keeps, the largest material one lease holds, and how many
- * leases may be outstanding at once. */
+/* The largest settings blob `open` keeps, and the largest material (and name) it serves. */
 #define SETTINGS_CAP 8192
 #define MATERIAL_CAP 1024
-#define LEASES 16
 /* The deepest JSON nesting the scanner follows. */
 #define DEPTH_CAP 32
 
@@ -77,18 +83,10 @@ static const bb_mech_Statement STATEMENT = {
 
 /* ---- the one instance ---- */
 
-struct lease {
-    uint64_t id; /* 0 = free */
-    size_t len;
-    uint8_t material[MATERIAL_CAP];
-};
-
 struct instance {
     int open;
     size_t settings_len;
     uint8_t settings[SETTINGS_CAP];
-    uint64_t next_lease;
-    struct lease leases[LEASES];
 };
 
 static struct instance THE_INSTANCE;
@@ -175,10 +173,8 @@ static int hex(uint8_t h) {
     return -1;
 }
 
-/* One JSON string at the cursor, decoded into `out` (`cap` bytes; `out` may be 0 to only scan).
- * Answers 1 and the decoded length in `*len`, or 0 when it is not a well-formed string or does not
- * fit. \u escapes decode to UTF-8 within the Basic Multilingual Plane; a surrogate is refused. */
-static int string(struct cursor *c, uint8_t *out, size_t cap, size_t *len) {
+/* [`string`]'s body, decoding through the caller's 3-byte scratch `enc`. */
+static int string_in(struct cursor *c, uint8_t *out, size_t cap, size_t *len, uint8_t *enc) {
     size_t n = 0;
     if (c->p >= c->end || *c->p != '"') {
         return 0;
@@ -187,7 +183,6 @@ static int string(struct cursor *c, uint8_t *out, size_t cap, size_t *len) {
     while (c->p < c->end) {
         uint8_t b = *c->p++;
         uint32_t cp;
-        uint8_t enc[3];
         size_t k, m;
         if (b == '"') {
             *len = n;
@@ -258,6 +253,17 @@ static int string(struct cursor *c, uint8_t *out, size_t cap, size_t *len) {
         }
     }
     return 0;
+}
+
+/* One JSON string at the cursor, decoded into `out` (`cap` bytes; `out` may be 0 to only scan).
+ * Answers 1 and the decoded length in `*len`, or 0 when it is not a well-formed string or does not
+ * fit. \u escapes decode to UTF-8 within the Basic Multilingual Plane; a surrogate is refused. The
+ * decoding scratch (a decoded material's last bytes) is zeroed before it returns. */
+static int string(struct cursor *c, uint8_t *out, size_t cap, size_t *len) {
+    uint8_t enc[3] = { 0, 0, 0 };
+    int r = string_in(c, out, cap, len, enc);
+    zero(enc, sizeof enc);
+    return r;
 }
 
 static int literal(struct cursor *c, const char *word) {
@@ -467,6 +473,8 @@ static const char NOT_STRINGS[] = "settings: every `values` entry must be a stri
 static const char EMPTY_VALUE[] = "settings: a `values` entry is empty; a secret must be non-empty";
 static const char VALUE_TOO_LARGE[] =
     "settings: a `values` entry is larger than a lease holds (1024 bytes)";
+static const char NO_LEASE[] =
+    "no such lease: a resolved value is written into the host's buffer, never leased";
 static const char TOO_LARGE[] = "settings: larger than this plugin keeps";
 
 /* Why the `values` object at the cursor (on its `{`) is not one this plugin serves, or 0; the
@@ -617,15 +625,6 @@ static const char *keep(struct instance *s, const bb_mech_Blob *settings) {
     return 0;
 }
 
-static void drop_leases(struct instance *s) {
-    size_t k;
-    for (k = 0; k < LEASES; k++) {
-        zero(s->leases[k].material, sizeof s->leases[k].material);
-        s->leases[k].id = 0;
-        s->leases[k].len = 0;
-    }
-}
-
 static bb_mech_RawOutcome op_open_held(void *inst, const void *in, void *out) {
     const bb_mech_OpenIn *i = in;
     bb_mech_OpenOut *o = out;
@@ -643,9 +642,7 @@ static bb_mech_RawOutcome op_open_held(void *inst, const void *in, void *out) {
         o->err_len = lend(i->err_buf, i->err_cap, why);
         return answer(&o->head, sizeof *o, BB_MECH_Outcome_Failed);
     }
-    drop_leases(&THE_INSTANCE);
     THE_INSTANCE.open = 1;
-    THE_INSTANCE.next_lease = 1;
     o->instance = &THE_INSTANCE;
     return answer(&o->head, sizeof *o, BB_MECH_Outcome_Ready);
 }
@@ -691,32 +688,20 @@ static bb_mech_RawOutcome op_cancel(void *inst, const void *in, void *out) {
     return answer(&o->head, sizeof *o, BB_MECH_Outcome_Ready);
 }
 
-static bb_mech_RawOutcome op_release_held(void *inst, const void *in, void *out) {
-    struct instance *s = inst;
+/* No lease is ever granted (a resolved value is the host's), so every release is refused. */
+static bb_mech_RawOutcome op_release(void *inst, const void *in, void *out) {
     const bb_mech_ReleaseIn *r = in;
     bb_mech_OutHead *o = out;
-    size_t k;
+    (void)inst;
     if (r->head.size < sizeof *r) {
         return say(o, sizeof *o, BB_MECH_Outcome_Refused, "release: short in");
     }
-    if (r->lease != 0) {
-        for (k = 0; k < LEASES; k++) {
-            if (s->leases[k].id == r->lease) {
-                /* The owner zeroises secret material on release (BLOB_SECRET). */
-                zero(s->leases[k].material, s->leases[k].len);
-                s->leases[k].id = 0;
-                s->leases[k].len = 0;
-                return answer(o, sizeof *o, BB_MECH_Outcome_Ready);
-            }
-        }
-    }
-    return say(o, sizeof *o, BB_MECH_Outcome_Refused, "no such lease");
+    return say(o, sizeof *o, BB_MECH_Outcome_Refused, NO_LEASE);
 }
 
 static bb_mech_RawOutcome op_close_held(void *inst, const void *in, void *out) {
     struct instance *s = inst;
     (void)in;
-    drop_leases(s);
     zero(s->settings, sizeof s->settings);
     s->settings_len = 0;
     s->open = 0;
@@ -729,6 +714,7 @@ static bb_mech_RawOutcome resolve_failed(bb_secret_ResolveOut *o, uint32_t kind,
     o->secret.ptr = 0;
     o->secret.len = 0;
     o->error_kind = kind;
+    o->needed = 0;
     return say(&o->head, sizeof *o, BB_MECH_Outcome_Failed, text);
 }
 
@@ -737,9 +723,8 @@ static bb_mech_RawOutcome op_resolve_held(void *inst, const void *in, void *out)
     const bb_secret_ResolveIn *i = in;
     bb_secret_ResolveOut *o = out;
     uint8_t name[MATERIAL_CAP];
-    size_t name_len = 0, k;
+    size_t name_len = 0, len = 0;
     struct cursor c, probe;
-    struct lease *slot = 0;
     if (i->head.size < sizeof *i || o->head.size < sizeof *o) {
         return say(&o->head, sizeof *o, BB_MECH_Outcome_Refused, "resolve: short frame");
     }
@@ -783,33 +768,38 @@ static bb_mech_RawOutcome op_resolve_held(void *inst, const void *in, void *out)
     if (!member(&c, 0, name, name_len)) {
         return resolve_failed(o, BB_SECRET_ERROR_KIND_NOT_FOUND, "no secret by that name");
     }
-    for (k = 0; k < LEASES; k++) {
-        if (s->leases[k].id == 0) {
-            slot = &s->leases[k];
-            break;
-        }
+    /* Its decoded length first (a scan writes nothing), then the material itself, decoded straight
+     * into the host's buffer: no copy of it is made on this side. */
+    probe = c;
+    if (!string(&probe, 0, 0, &len)) {
+        return resolve_failed(o, BB_SECRET_ERROR_KIND_INTERNAL,
+                              "resolve: the kept settings hold a malformed value");
     }
-    if (slot == 0) {
-        return resolve_failed(o, BB_SECRET_ERROR_KIND_INTERNAL, "resolve: every lease is outstanding");
-    }
-    if (!string(&c, slot->material, sizeof slot->material, &slot->len)) {
-        zero(slot->material, sizeof slot->material);
-        slot->len = 0;
-        return resolve_failed(o, BB_SECRET_ERROR_KIND_INVALID,
-                              "resolve: the material is larger than a lease holds");
-    }
-    if (slot->len == 0) {
-        /* Fail closed: an empty value is an error, never an empty success. The slot stays free. */
+    if (len == 0) {
+        /* Fail closed: an empty value is an error, never an empty success. */
         return resolve_failed(o, BB_SECRET_ERROR_KIND_INVALID,
                               "resolve: the material is empty; a secret must be non-empty");
     }
+    if (i->secret_buf == 0 || len > i->secret_cap) {
+        /* THE SHORT-BUFFER ANSWER: nothing written, `needed` the full length, no error kind. */
+        o->secret.ptr = 0;
+        o->secret.len = 0;
+        o->error_kind = BB_SECRET_ERROR_KIND_UNSET;
+        o->needed = len;
+        return answer(&o->head, sizeof *o, BB_MECH_Outcome_Failed);
+    }
+    if (!string(&c, i->secret_buf, i->secret_cap, &len)) {
+        zero(i->secret_buf, i->secret_cap);
+        return resolve_failed(o, BB_SECRET_ERROR_KIND_INTERNAL,
+                              "resolve: the material did not decode into the host's buffer");
+    }
     o->error_kind = BB_SECRET_ERROR_KIND_UNSET;
+    o->needed = 0;
     o->secret.fmt = BB_MECH_BLOB_OCTETS;
     o->secret.flags = BB_MECH_BLOB_SECRET;
-    slot->id = s->next_lease++;
-    o->secret.ptr = slot->material;
-    o->secret.len = slot->len;
-    o->head.lease = slot->id;
+    o->secret.ptr = i->secret_buf;
+    o->secret.len = len;
+    o->head.lease = 0;
     return answer(&o->head, sizeof *o, BB_MECH_Outcome_Ready);
 }
 
@@ -844,7 +834,6 @@ static bb_mech_RawOutcome op_check(void *inst, const void *in, void *out) {
 
 HELD(op_open)
 HELD(op_refresh)
-HELD(op_release)
 HELD(op_close)
 HELD(op_resolve)
 
@@ -878,6 +867,16 @@ static const bb_mech_Door DOOR = {
     .statement = &STATEMENT,
     .ops = (const bb_mech_OpsHead *)&OPS,
 };
+
+#ifdef BUSBAR_SECRET_C_UNIT
+/* TEST ONLY (tests/unit.c, never in a plugin build): the one instance's memory, so a unit case can
+ * prove what it holds. */
+const void *busbar_secret_c_instance(size_t *len);
+const void *busbar_secret_c_instance(size_t *len) {
+    *len = sizeof THE_INSTANCE;
+    return &THE_INSTANCE;
+}
+#endif
 
 /* THE ONE SYMBOL (BB_MECH_DOOR_SYMBOL). */
 DOOR_EXPORT const bb_mech_Door *busbar_plugin_door(void) {
