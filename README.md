@@ -21,7 +21,9 @@ It serves named secrets whose material is written in its own settings.
 
 ## Config
 
-Configured under the `c` module name. The instance's settings name each secret and its material:
+Configured under the `secret-c` module name (the Statement states it as its own alias):
+`{ module: secret-c, settings: { name: db } }` for a reference. The instance's settings name each
+secret and its material:
 
 ```json
 {"values": {"db": "s3cr3t", "api": "k3y"}}
@@ -29,11 +31,17 @@ Configured under the `c` module name. The instance's settings name each secret a
 
 `values` is the only setting, given once; any other is refused, and so is an empty value or one
 over 1 KiB, and a name that is empty, over 1 KiB or given twice (every name kept can be asked for),
-at `validate`, `open` and `refresh` alike. A refused `refresh` keeps the settings it replaced.
+at `validate`, `open` and `refresh` alike. Settings of no bytes are refused
+(`settings: c requires settings (values); none provided`). A refused `refresh` keeps the settings it replaced.
 
 A secret reference's settings name one of them: `{"name": "db"}`. A name it does not hold fails
-with NOT_FOUND; a reference that is not `{"name": "<non-empty string>"}`, that names another
-setting, or that names `name` twice, fails with INVALID. A resolved material is decoded straight into the host's buffer
+with NOT_FOUND (`c holds no secret by that name`); a reference that is not
+`{"name": "<non-empty string>"}`, that names another setting, or that names `name` twice, fails
+with INVALID, in the vault plugin's words ("missing or non-string `name` in secret reference
+settings", `c secret reference names only settings.name (fail-closed)`, ...; the kernel prefixes the
+module). A reference of no bytes is `{}`, so it is missing `name`. A static text cannot name the
+stray key, so the extra-key refusal does not. An empty material is refused (`the material is EMPTY;
+a secret must be non-empty (fail-closed)`). A resolved material is decoded straight into the host's buffer
 (flagged secret) under no lease, and the plugin keeps no copy of it; a material over that buffer
 gets the short-buffer answer. At most one instance, whose ops hold one lock (a `refresh` never
 races a `resolve`); at most 8 KiB of settings (as written), 1 KiB of material per name and 1 KiB
@@ -49,6 +57,9 @@ Against `busbar_plugin.h` from busbar at the commit in `.busbar-ref`
 cc -std=c11 -Wall -Wextra -Werror -pedantic -fPIC -shared \
   -I <busbar>/crates/busbar-contract/include -o libbusbar_secret_c.so secret-c/*.c
 ```
+
+`.version` in the Statement is a literal (`"1.6.0"`, there is no Cargo here): bump it by hand at
+release.
 
 ## Tests
 

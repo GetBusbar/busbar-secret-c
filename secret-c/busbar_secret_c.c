@@ -77,6 +77,11 @@
 
 /* ---- the Statement ---- */
 
+/* The plugin states its own config word (every sibling does): `secret-c`, the manifest alias. */
+static const bb_mech_Rewrite REWRITES[] = {
+    { .class_ = BB_MECH_REWRITE_ALIAS, .from = STR("secret-c"), .to = STR("") },
+};
+
 static const bb_mech_Statement STATEMENT = {
     .size = (uint32_t)sizeof(bb_mech_Statement),
     .kind = (uint32_t)BB_MECH_KindCode_Secret,
@@ -85,6 +90,8 @@ static const bb_mech_Statement STATEMENT = {
     .name = STR("busbar-secret-c"),
     .version = STR("1.6.0"),
     .marks = BB_MECH_MARK_ONE_INSTANCE,
+    .rewrites = REWRITES,
+    .rewrites_len = sizeof REWRITES / sizeof REWRITES[0],
 };
 
 /* ---- the one instance ---- */
@@ -498,8 +505,9 @@ static int member(struct cursor *c, const char *want_text, const uint8_t *want, 
     }
 }
 
-static const char NOT_AN_OBJECT[] = "settings must be one JSON object, nested at most "
+static const char NOT_AN_OBJECT[] = "settings: must be a JSON object; nested at most "
                                     TEXT(DEPTH_CAP) " deep, with no unpaired \\u surrogate";
+static const char NO_SETTINGS[] = "settings: c requires settings (values); none provided";
 static const char NO_VALUES[] = "settings: `values` must be an object";
 static const char ONLY_VALUES[] = "settings: `values` is the only setting";
 static const char VALUES_TWICE[] = "settings: `values` is given more than once";
@@ -508,11 +516,13 @@ static const char NAME_TOO_LARGE[] = "settings: a `values` name is longer than "
                                      " bytes, the most a reference may name";
 static const char NAME_TWICE[] = "settings: a `values` name is given more than once";
 static const char NOT_STRINGS[] = "settings: every `values` entry must be a string";
-static const char EMPTY_VALUE[] = "settings: a `values` entry is empty; a secret must be non-empty";
+static const char EMPTY_VALUE[] = "settings: a `values` entry is EMPTY; a secret must be non-empty (fail-closed)";
 static const char VALUE_TOO_LARGE[] = "settings: a `values` entry is larger than " TEXT(
     MATERIAL_CAP) " bytes, the most this plugin serves";
 static const char NO_LEASE[] =
-    "no such lease: a resolved value is written into the host's buffer, never leased";
+    "release: no such lease (a resolved value is written into the host's buffer, never leased)";
+static const char MISSING_NAME[] = "missing or non-string `name` in secret reference settings";
+static const char NO_SUCH_NAME[] = "c holds no secret by that name";
 static const char TOO_LARGE[] = "settings: larger than this plugin keeps";
 
 /* Whether a name before `upto` in the `values` object whose first entry starts at `from` decodes
@@ -603,6 +613,9 @@ static const char *values_refusal(struct cursor *c) {
 static const char *settings_refusal(const uint8_t *ptr, size_t len) {
     struct cursor c;
     int seen = 0;
+    if (len == 0) {
+        return NO_SETTINGS;
+    }
     if (len > SETTINGS_CAP) {
         return TOO_LARGE;
     }
@@ -724,7 +737,10 @@ static bb_mech_RawOutcome op_open_held(void *inst, const void *in, void *out) {
     bb_mech_OpenOut *o = out;
     const char *why;
     (void)inst;
-    if (i->head.size < sizeof *i || o->head.size < sizeof *o) {
+    if (o == 0 || o->head.size < sizeof *o) {
+        return (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
+    }
+    if (i->head.size < sizeof *i) {
         return say(&o->head, sizeof *o, BB_MECH_Outcome_Refused, "open: short frame");
     }
     if (THE_INSTANCE.open) {
@@ -773,9 +789,10 @@ static bb_mech_RawOutcome op_tick(void *inst, const void *in, void *out) {
     bb_mech_TickOut *o = out;
     (void)inst;
     (void)in;
-    if (o->head.size >= sizeof *o) {
-        o->next_tick_ns = 0;
+    if (o == 0 || o->head.size < sizeof *o) {
+        return (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
     }
+    o->next_tick_ns = 0;
     return answer(&o->head, sizeof *o, BB_MECH_Outcome_Ready);
 }
 
@@ -783,9 +800,10 @@ static bb_mech_RawOutcome op_cancel(void *inst, const void *in, void *out) {
     bb_mech_CancelOut *o = out;
     (void)inst;
     (void)in;
-    if (o->head.size >= sizeof *o) {
-        o->disposition = BB_SECRET_CANCEL_ABORTED;
+    if (o == 0 || o->head.size < sizeof *o) {
+        return (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
     }
+    o->disposition = BB_SECRET_CANCEL_ABORTED;
     return answer(&o->head, sizeof *o, BB_MECH_Outcome_Ready);
 }
 
@@ -834,41 +852,47 @@ static bb_mech_RawOutcome op_resolve_held(void *inst, const void *in, void *out)
     size_t name_len = 0, len = 0;
     int members;
     struct cursor c, probe;
-    if (i->head.size < sizeof *i || o->head.size < sizeof *o) {
+    if (o == 0 || o->head.size < sizeof *o) {
+        return (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
+    }
+    if (i->head.size < sizeof *i) {
         return say(&o->head, sizeof *o, BB_MECH_Outcome_Refused, "resolve: short frame");
     }
-    /* The name asked for: {"name": "<string>"}. */
+    /* The name asked for: {"name": "<string>"}. No bytes at all is `{}` (the SDK's settings_of). */
+    if (i->settings.len == 0) {
+        return resolve_failed(o, BB_SECRET_ERROR_KIND_INVALID, MISSING_NAME);
+    }
     if (!one_object(i->settings.ptr, i->settings.len)) {
         return resolve_failed(o, BB_SECRET_ERROR_KIND_INVALID,
-                              "resolve: the settings must be a JSON object");
+                              "secret settings are not a JSON object");
     }
     c.p = i->settings.ptr;
     c.end = i->settings.ptr + i->settings.len;
     ws(&c);
     c.p++;
     if (!member(&c, "name", 0, 0)) {
-        return resolve_failed(o, BB_SECRET_ERROR_KIND_INVALID, "resolve: `name` must be a string");
+        return resolve_failed(o, BB_SECRET_ERROR_KIND_INVALID, MISSING_NAME);
     }
     members = only_member(i->settings.ptr, i->settings.len, "name");
     if (members < 0) {
         return resolve_failed(o, BB_SECRET_ERROR_KIND_INVALID,
-                              "resolve: a reference names only `name`");
+                              "c secret reference names only settings.name (fail-closed)");
     }
     if (members != 1) {
         return resolve_failed(o, BB_SECRET_ERROR_KIND_INVALID,
-                              "resolve: a reference names `name` once");
+                              "c secret reference names settings.name once (fail-closed)");
     }
     probe = c;
     if (!string(&c, name, sizeof name, &name_len)) {
         /* A well-formed string too long to be held names nothing this plugin holds. */
         if (string(&probe, 0, 0, &name_len)) {
-            return resolve_failed(o, BB_SECRET_ERROR_KIND_NOT_FOUND, "no secret by that name");
+            return resolve_failed(o, BB_SECRET_ERROR_KIND_NOT_FOUND, NO_SUCH_NAME);
         }
-        return resolve_failed(o, BB_SECRET_ERROR_KIND_INVALID, "resolve: `name` must be a string");
+        return resolve_failed(o, BB_SECRET_ERROR_KIND_INVALID, MISSING_NAME);
     }
     if (name_len == 0) {
         return resolve_failed(o, BB_SECRET_ERROR_KIND_INVALID,
-                              "resolve: `name` must be a non-empty string");
+                              "`name` in secret reference settings must not be blank");
     }
     /* The instance's `values` (validated when it was kept). */
     c.p = s->settings;
@@ -880,7 +904,7 @@ static bb_mech_RawOutcome op_resolve_held(void *inst, const void *in, void *out)
     }
     c.p++;
     if (!member(&c, 0, name, name_len)) {
-        return resolve_failed(o, BB_SECRET_ERROR_KIND_NOT_FOUND, "no secret by that name");
+        return resolve_failed(o, BB_SECRET_ERROR_KIND_NOT_FOUND, NO_SUCH_NAME);
     }
     /* Its decoded length first (a scan writes nothing), then the material itself, decoded straight
      * into the host's buffer: no copy of it is made on this side. */
@@ -892,7 +916,7 @@ static bb_mech_RawOutcome op_resolve_held(void *inst, const void *in, void *out)
     if (len == 0) {
         /* Fail closed: an empty value is an error, never an empty success. */
         return resolve_failed(o, BB_SECRET_ERROR_KIND_INVALID,
-                              "resolve: the material is empty; a secret must be non-empty");
+                              "the material is EMPTY; a secret must be non-empty (fail-closed)");
     }
     if (i->secret_buf == 0 || len > i->secret_cap) {
         /* THE SHORT-BUFFER ANSWER: nothing written, `needed` the full length, no error kind. */
