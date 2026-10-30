@@ -690,6 +690,7 @@ static void a_short_out_is_a_fault_at_the_rest(void) {
     CHECK(head_ops()->open(0, &oin, &oout) == BB_MECH_Outcome_Fault && oout.err_len == 0,
           "open: a short out is a FAULT");
     CHECK(head_ops()->open(0, &oin, 0) == BB_MECH_Outcome_Fault, "open: a NULL out is a FAULT");
+    memset(buf, 0, sizeof buf);
     memset(&rin, 0, sizeof rin);
     rin.head.size = sizeof rin;
     rin.settings = blob("{\"name\": \"db\"}");
