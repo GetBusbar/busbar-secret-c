@@ -27,15 +27,18 @@ Configured under the `c` module name. The instance's settings name each secret a
 {"values": {"db": "s3cr3t", "api": "k3y"}}
 ```
 
-`values` is the only setting; any other is refused, and so is an empty value or one over 1 KiB,
-at `validate`, `open` and `refresh` alike.
+`values` is the only setting, given once; any other is refused, and so is an empty value or one
+over 1 KiB, and a name that is empty, over 1 KiB or given twice (every name kept can be asked for),
+at `validate`, `open` and `refresh` alike. A refused `refresh` keeps the settings it replaced.
 
 A secret reference's settings name one of them: `{"name": "db"}`. A name it does not hold fails
-with NOT_FOUND; a reference that is not `{"name": "<non-empty string>"}`, or that names another
-setting, fails with INVALID. A resolved material is decoded straight into the host's buffer
+with NOT_FOUND; a reference that is not `{"name": "<non-empty string>"}`, that names another
+setting, or that names `name` twice, fails with INVALID. A resolved material is decoded straight into the host's buffer
 (flagged secret) under no lease, and the plugin keeps no copy of it; a material over that buffer
 gets the short-buffer answer. At most one instance, whose ops hold one lock (a `refresh` never
-races a `resolve`); at most 8 KiB of settings and 1 KiB of material per name.
+races a `resolve`); at most 8 KiB of settings (as written), 1 KiB of material per name and 1 KiB
+per name (both decoded), and JSON nested at most 32 deep. `\u` escapes decode to UTF-8, a
+surrogate pair to its 4 bytes; an unpaired surrogate is refused.
 
 ## Build
 
