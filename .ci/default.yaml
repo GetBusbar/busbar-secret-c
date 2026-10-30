@@ -242,7 +242,7 @@ env:
     [ "$PLUGIN_LANG" = c ] && step always "C: the kind's conformance through load_dropped" s_cconf
     exit $fail
 on:
-  move: [pin, linux]
+  move: [pin, linux, cunit]
 checks:
   pin:
     # ci / the busbar pin is one commit
@@ -259,3 +259,19 @@ checks:
     needs: [pin]
     run: |
       exec bash -c "$PLUGIN_CI" plugin-ci linux
+  cunit:
+    # secret-c's unit tests (secret-c/tests/unit.c, incl. the refresh/resolve race under -fsanitize=thread),
+    # built against busbar_plugin.h at the plugin's .busbar-ref pin. Owner-approved 2026-10-30 (OWNER-QUEUE 21).
+    env_from_run: []
+    priority: low
+    requires: [cc]
+    needs: [pin]
+    run: |
+      set -euo pipefail
+      sha="$(awk '{print $1; exit}' .busbar-ref)"
+      [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "cunit: .busbar-ref field 1 is not a full 40-hex sha: '$sha'" >&2; exit 1; }
+      d="$(mktemp -d)"; trap 'rm -rf "$d"' EXIT
+      curl -fsSL --retry 3 -o "$d/busbar_plugin.h" "https://raw.githubusercontent.com/GetBusbar/busbar/$sha/crates/busbar-contract/include/busbar_plugin.h"
+      cc -std=c11 -Wall -Wextra -Werror -pedantic -fsanitize=thread -g -DBUSBAR_SECRET_C_UNIT -I "$d" \
+        -o "$d/unit" secret-c/busbar_secret_c.c secret-c/tests/unit.c -lpthread
+      "$d/unit"
