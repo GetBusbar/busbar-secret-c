@@ -205,10 +205,13 @@ env:
       "$deny" --locked check
     }
     s_cconf() {
+      # busbar-test-kit's `dropped_conformance` example (busbar 2beb134033 moved the runner out of
+      # busbar-plugin-loader), exactly as busbar's plugin-ci.yml runs it at the pin: both proofs or red.
       cd busbar
-      out="$(cargo test --locked -p busbar-plugin-loader --test dropped_conformance -- --ignored 2>&1 | tee /dev/stderr)"
-      passed="$(printf '%s\n' "$out" | sed -nE 's/^test result: ok\. ([0-9]+) passed.*/\1/p' | awk '{s+=$1} END {print s+0}')"
-      [ "$passed" -ge 2 ] || { echo "the C conformance ran $passed of its 2 tests"; exit 1; }
+      rc=0; out="$(cargo run --locked -p busbar-test-kit --example dropped_conformance 2>&1)" || rc=$?
+      printf '%s\n' "$out"
+      [ "$rc" -eq 0 ] || { echo "the C conformance exited $rc"; exit 1; }
+      printf '%s\n' "$out" | grep -qx "dropped conformance: 2 proofs passed" || { echo "the C conformance did not run both of its proofs"; exit 1; }
     }
 
     signing=false; case "$PLUGIN_KIND" in store|auth|hook|secret) signing=true ;; esac
