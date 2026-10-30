@@ -15,8 +15,10 @@
  *
  * Per op of the secret table:
  *   validate / open / refresh  the settings must be one JSON object whose one setting is `values`,
- *                              an object of non-empty strings of at most MATERIAL_CAP bytes each;
- *                              anything else FAILS naming why, the same at all three. `open` keeps
+ *                              an object of non-empty strings of at most MATERIAL_CAP bytes each,
+ *                              under distinct non-empty names of at most MATERIAL_CAP bytes (so
+ *                              every name it keeps can be asked for), given once; anything else
+ *                              FAILS naming why, the same at all three. `open` keeps
  *                              a copy of the settings (at most SETTINGS_CAP bytes); `refresh`
  *                              replaces it.
  *   resolve   READY with the material decoded straight into the HOST'S buffer (`secret_buf`,
@@ -25,7 +27,8 @@
  *             host's buffer is the short-buffer answer (FAILED, `needed` its length, nothing
  *             written); the host re-calls with a buffer that size. A name it does not hold FAILS
  *             with NOT_FOUND; a resolve settings blob that is not {"name": "<non-empty string>"}
- *             (another setting included) FAILS with INVALID; an empty material FAILS with INVALID.
+ *             (another setting, or `name` twice, included) FAILS with INVALID; an empty material
+ *             FAILS with INVALID.
  *   release   REFUSED: no lease is ever granted.
  *   check     REFUSED ("not served"): resolve judges every reference.
  *   close     the kept settings (the only copy of the material it serves) are zeroed; the
@@ -34,7 +37,8 @@
  * WHAT IT HOLDS: the material lives in the instance's kept settings, zeroed (volatile writes) when
  * a `refresh` replaces them and when it is closed. A resolve decodes into the host's buffer
  * byte by byte; the few bytes of decoding scratch on its stack are zeroed before it returns.
- *   the rest of the lifecycle answers READY.
+ * The rest of the lifecycle (retire, tick, drive, cancel) answers READY. An `out` shorter than its
+ * head is a FAULT at every op, written nothing.
  *
  * BUSBAR_PLUGIN_KIND_ABI (default BB_SECRET_ABI_VERSION) is the kind ABI the door and its
  * Statement state. busbar's C conformance builds this source again with another value: the
@@ -62,6 +66,8 @@
 #endif
 
 #define STR(s) { (const uint8_t *)(s), sizeof(s) - 1 }
+#define TEXT_(x) #x
+#define TEXT(x) TEXT_(x)
 
 /* The largest settings blob `open` keeps, and the largest material (and name) it serves. */
 #define SETTINGS_CAP 8192
@@ -173,7 +179,7 @@ static int hex(uint8_t h) {
     return -1;
 }
 
-/* [`string`]'s body, decoding through the caller's 3-byte scratch `enc`. */
+/* [`string`]'s body, decoding through the caller's 4-byte scratch `enc`. */
 static int string_in(struct cursor *c, uint8_t *out, size_t cap, size_t *len, uint8_t *enc) {
     size_t n = 0;
     if (c->p >= c->end || *c->p != '"') {
@@ -222,8 +228,28 @@ static int string_in(struct cursor *c, uint8_t *out, size_t cap, size_t *len, ui
                     cp = cp * 16 + (uint32_t)h;
                 }
                 c->p += 4;
-                if (cp >= 0xD800 && cp <= 0xDFFF) {
-                    return 0;
+                if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                    return 0; /* a low surrogate with no high one before it */
+                }
+                if (cp >= 0xD800 && cp <= 0xDBFF) {
+                    /* RFC 8259 section 7: a character past the Basic Multilingual Plane is a
+                     * high surrogate escape followed by a low one; anything else is unpaired. */
+                    uint32_t lo = 0;
+                    if (c->end - c->p < 6 || c->p[0] != '\\' || c->p[1] != 'u') {
+                        return 0;
+                    }
+                    for (k = 0; k < 4; k++) {
+                        int h = hex(c->p[2 + k]);
+                        if (h < 0) {
+                            return 0;
+                        }
+                        lo = lo * 16 + (uint32_t)h;
+                    }
+                    if (lo < 0xDC00 || lo > 0xDFFF) {
+                        return 0;
+                    }
+                    c->p += 6;
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
                 }
                 if (cp < 0x80) {
                     enc[0] = (uint8_t)cp;
@@ -231,11 +257,17 @@ static int string_in(struct cursor *c, uint8_t *out, size_t cap, size_t *len, ui
                     enc[0] = (uint8_t)(0xC0 | (cp >> 6));
                     enc[1] = (uint8_t)(0x80 | (cp & 0x3F));
                     m = 2;
-                } else {
+                } else if (cp < 0x10000) {
                     enc[0] = (uint8_t)(0xE0 | (cp >> 12));
                     enc[1] = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));
                     enc[2] = (uint8_t)(0x80 | (cp & 0x3F));
                     m = 3;
+                } else {
+                    enc[0] = (uint8_t)(0xF0 | (cp >> 18));
+                    enc[1] = (uint8_t)(0x80 | ((cp >> 12) & 0x3F));
+                    enc[2] = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));
+                    enc[3] = (uint8_t)(0x80 | (cp & 0x3F));
+                    m = 4;
                 }
                 break;
             default:
@@ -257,10 +289,10 @@ static int string_in(struct cursor *c, uint8_t *out, size_t cap, size_t *len, ui
 
 /* One JSON string at the cursor, decoded into `out` (`cap` bytes; `out` may be 0 to only scan).
  * Answers 1 and the decoded length in `*len`, or 0 when it is not a well-formed string or does not
- * fit. \u escapes decode to UTF-8 within the Basic Multilingual Plane; a surrogate is refused. The
- * decoding scratch (a decoded material's last bytes) is zeroed before it returns. */
+ * fit. \u escapes decode to UTF-8, a surrogate pair to its 4 bytes; an unpaired surrogate is
+ * refused. The decoding scratch (a decoded material's last bytes) is zeroed before it returns. */
 static int string(struct cursor *c, uint8_t *out, size_t cap, size_t *len) {
-    uint8_t enc[3] = { 0, 0, 0 };
+    uint8_t enc[4] = { 0, 0, 0, 0 };
     int r = string_in(c, out, cap, len, enc);
     zero(enc, sizeof enc);
     return r;
@@ -466,32 +498,83 @@ static int member(struct cursor *c, const char *want_text, const uint8_t *want, 
     }
 }
 
-static const char NOT_AN_OBJECT[] = "settings must be one JSON object";
+static const char NOT_AN_OBJECT[] = "settings must be one JSON object, nested at most "
+                                    TEXT(DEPTH_CAP) " deep, with no unpaired \\u surrogate";
 static const char NO_VALUES[] = "settings: `values` must be an object";
 static const char ONLY_VALUES[] = "settings: `values` is the only setting";
+static const char VALUES_TWICE[] = "settings: `values` is given more than once";
+static const char EMPTY_NAME[] = "settings: a `values` name is empty";
+static const char NAME_TOO_LARGE[] = "settings: a `values` name is longer than " TEXT(MATERIAL_CAP)
+                                     " bytes, the most a reference may name";
+static const char NAME_TWICE[] = "settings: a `values` name is given more than once";
 static const char NOT_STRINGS[] = "settings: every `values` entry must be a string";
 static const char EMPTY_VALUE[] = "settings: a `values` entry is empty; a secret must be non-empty";
-static const char VALUE_TOO_LARGE[] =
-    "settings: a `values` entry is larger than a lease holds (1024 bytes)";
+static const char VALUE_TOO_LARGE[] = "settings: a `values` entry is larger than " TEXT(
+    MATERIAL_CAP) " bytes, the most this plugin serves";
 static const char NO_LEASE[] =
     "no such lease: a resolved value is written into the host's buffer, never leased";
 static const char TOO_LARGE[] = "settings: larger than this plugin keeps";
 
+/* Whether a name before `upto` in the `values` object whose first entry starts at `from` decodes
+ * to `name` (`len` bytes). Every name before `upto` was judged already, so each decodes whole. */
+static int named_before(const uint8_t *from, const uint8_t *upto, const uint8_t *end,
+                        const uint8_t *name, size_t len) {
+    uint8_t seen[MATERIAL_CAP];
+    struct cursor c;
+    size_t n, k;
+    c.p = from;
+    c.end = end;
+    for (;;) {
+        ws(&c);
+        if (c.p >= upto || !string(&c, seen, sizeof seen, &n)) {
+            return 0;
+        }
+        if (n == len) {
+            for (k = 0; k < n && seen[k] == name[k]; k++) {
+            }
+            if (k == n) {
+                return 1;
+            }
+        }
+        ws(&c);
+        c.p++; /* ':' */
+        if (!value(&c, 1)) {
+            return 0;
+        }
+        ws(&c);
+        c.p++; /* ',' */
+    }
+}
+
 /* Why the `values` object at the cursor (on its `{`) is not one this plugin serves, or 0; the
- * cursor ends past its `}`. Every entry is judged here, so `resolve` never meets a value it
- * cannot lease: an empty one, or one larger than a lease holds. */
+ * cursor ends past its `}`. Every entry is judged here, so `resolve` never meets a value it cannot
+ * serve (an empty one, or one over MATERIAL_CAP) and every name kept can be asked for: none is
+ * empty, over MATERIAL_CAP, or given twice. */
 static const char *values_refusal(struct cursor *c) {
+    const uint8_t *first;
     c->p++;
     ws(c);
     if (c->p < c->end && *c->p == '}') {
         c->p++;
         return 0;
     }
+    first = c->p;
     for (;;) {
+        uint8_t name[MATERIAL_CAP];
+        const uint8_t *at;
+        struct cursor probe;
         size_t n;
         ws(c);
-        if (!string(c, 0, 0, &n)) {
-            return NOT_STRINGS;
+        at = c->p;
+        probe = *c;
+        if (!string(c, name, sizeof name, &n)) {
+            return string(&probe, 0, 0, &n) ? NAME_TOO_LARGE : NOT_STRINGS;
+        }
+        if (n == 0) {
+            return EMPTY_NAME;
+        }
+        if (named_before(first, at, c->end, name, n)) {
+            return NAME_TWICE;
         }
         ws(c);
         c->p++; /* ':' */
@@ -519,6 +602,7 @@ static const char *values_refusal(struct cursor *c) {
  * `values`; any other setting is refused, never ignored. */
 static const char *settings_refusal(const uint8_t *ptr, size_t len) {
     struct cursor c;
+    int seen = 0;
     if (len > SETTINGS_CAP) {
         return TOO_LARGE;
     }
@@ -536,9 +620,13 @@ static const char *settings_refusal(const uint8_t *ptr, size_t len) {
     for (;;) {
         const char *why;
         ws(&c);
-        if (key_is(&c, (const uint8_t *)"values", 6) != 1) {
+        if (key_is(&c, (const uint8_t *)"values", length("values")) != 1) {
             return ONLY_VALUES;
         }
+        if (seen) {
+            return VALUES_TWICE;
+        }
+        seen = 1;
         ws(&c);
         c.p++; /* ':' */
         ws(&c);
@@ -558,8 +646,10 @@ static const char *settings_refusal(const uint8_t *ptr, size_t len) {
     }
 }
 
-/* Whether every member of the well-formed object `ptr[0..len]` is named `want`. */
+/* How many members the well-formed object `ptr[0..len]` has, when every one is named `want`;
+ * -1 when one is named anything else. */
 static int only_member(const uint8_t *ptr, size_t len, const char *want) {
+    int count = 0;
     struct cursor c;
     c.p = ptr;
     c.end = ptr + len;
@@ -567,24 +657,25 @@ static int only_member(const uint8_t *ptr, size_t len, const char *want) {
     c.p++;
     ws(&c);
     if (c.p < c.end && *c.p == '}') {
-        return 1;
+        return 0;
     }
     for (;;) {
         ws(&c);
         if (key_is(&c, (const uint8_t *)want, length(want)) != 1) {
-            return 0;
+            return -1;
         }
+        count++;
         ws(&c);
         c.p++; /* ':' */
         if (!value(&c, 1)) {
-            return 0;
+            return -1;
         }
         ws(&c);
         if (c.p < c.end && *c.p == ',') {
             c.p++;
             continue;
         }
-        return 1;
+        return count;
     }
 }
 
@@ -596,6 +687,9 @@ static bb_mech_RawOutcome op_validate(void *inst, const void *in, void *out) {
     const char *why;
     size_t n;
     (void)inst;
+    if (o == 0 || o->size < sizeof *o) {
+        return (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
+    }
     if (v->head.size < sizeof *v) {
         return say(o, sizeof *o, BB_MECH_Outcome_Refused, "validate: short in");
     }
@@ -652,6 +746,9 @@ static bb_mech_RawOutcome op_refresh_held(void *inst, const void *in, void *out)
     const bb_mech_RefreshIn *r = in;
     bb_mech_OutHead *o = out;
     const char *why;
+    if (o == 0 || o->size < sizeof *o) {
+        return (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
+    }
     if (r->head.size < sizeof *r) {
         return say(o, sizeof *o, BB_MECH_Outcome_Refused, "refresh: short in");
     }
@@ -663,9 +760,13 @@ static bb_mech_RawOutcome op_refresh_held(void *inst, const void *in, void *out)
 }
 
 static bb_mech_RawOutcome op_ready(void *inst, const void *in, void *out) {
+    bb_mech_OutHead *o = out;
     (void)inst;
     (void)in;
-    return answer(out, sizeof(bb_mech_OutHead), BB_MECH_Outcome_Ready);
+    if (o == 0 || o->size < sizeof *o) {
+        return (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
+    }
+    return answer(o, sizeof *o, BB_MECH_Outcome_Ready);
 }
 
 static bb_mech_RawOutcome op_tick(void *inst, const void *in, void *out) {
@@ -693,6 +794,9 @@ static bb_mech_RawOutcome op_release(void *inst, const void *in, void *out) {
     const bb_mech_ReleaseIn *r = in;
     bb_mech_OutHead *o = out;
     (void)inst;
+    if (o == 0 || o->size < sizeof *o) {
+        return (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
+    }
     if (r->head.size < sizeof *r) {
         return say(o, sizeof *o, BB_MECH_Outcome_Refused, "release: short in");
     }
@@ -701,11 +805,15 @@ static bb_mech_RawOutcome op_release(void *inst, const void *in, void *out) {
 
 static bb_mech_RawOutcome op_close_held(void *inst, const void *in, void *out) {
     struct instance *s = inst;
+    bb_mech_OutHead *o = out;
     (void)in;
+    if (o == 0 || o->size < sizeof *o) {
+        return (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
+    }
     zero(s->settings, sizeof s->settings);
     s->settings_len = 0;
     s->open = 0;
-    return answer(out, sizeof(bb_mech_OutHead), BB_MECH_Outcome_Ready);
+    return answer(o, sizeof *o, BB_MECH_Outcome_Ready);
 }
 
 /* ---- the secret op ---- */
@@ -724,6 +832,7 @@ static bb_mech_RawOutcome op_resolve_held(void *inst, const void *in, void *out)
     bb_secret_ResolveOut *o = out;
     uint8_t name[MATERIAL_CAP];
     size_t name_len = 0, len = 0;
+    int members;
     struct cursor c, probe;
     if (i->head.size < sizeof *i || o->head.size < sizeof *o) {
         return say(&o->head, sizeof *o, BB_MECH_Outcome_Refused, "resolve: short frame");
@@ -740,9 +849,14 @@ static bb_mech_RawOutcome op_resolve_held(void *inst, const void *in, void *out)
     if (!member(&c, "name", 0, 0)) {
         return resolve_failed(o, BB_SECRET_ERROR_KIND_INVALID, "resolve: `name` must be a string");
     }
-    if (!only_member(i->settings.ptr, i->settings.len, "name")) {
+    members = only_member(i->settings.ptr, i->settings.len, "name");
+    if (members < 0) {
         return resolve_failed(o, BB_SECRET_ERROR_KIND_INVALID,
                               "resolve: a reference names only `name`");
+    }
+    if (members != 1) {
+        return resolve_failed(o, BB_SECRET_ERROR_KIND_INVALID,
+                              "resolve: a reference names `name` once");
     }
     probe = c;
     if (!string(&c, name, sizeof name, &name_len)) {
