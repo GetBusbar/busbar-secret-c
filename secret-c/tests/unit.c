@@ -120,6 +120,47 @@ static void close_instance(void *inst) {
     head_ops()->close(inst, 0, &out);
 }
 
+
+/* open: the refusal text in `why` ("" when it opened; the instance is closed again). */
+static int open_text(const char *settings, char *why, size_t cap) {
+    bb_mech_OpenIn in;
+    bb_mech_OpenOut out;
+    uint8_t buf[256];
+    memset(&in, 0, sizeof in);
+    memset(&out, 0, sizeof out);
+    in.head.size = sizeof in;
+    in.settings = blob(settings);
+    in.err_buf = buf;
+    in.err_cap = sizeof buf;
+    out.head.size = sizeof out;
+    head_ops()->open(0, &in, &out);
+    why[0] = 0;
+    if (out.head.outcome == BB_MECH_Outcome_Ready) {
+        close_instance(out.instance);
+        return 1;
+    }
+    snprintf(why, cap, "%.*s", (int)out.err_len, (const char *)buf);
+    return 0;
+}
+
+/* refresh: the refusal text in `why`. */
+static int refresh_text(void *inst, const char *settings, char *why, size_t cap) {
+    bb_mech_RefreshIn in;
+    bb_mech_OutHead out;
+    memset(&in, 0, sizeof in);
+    memset(&out, 0, sizeof out);
+    in.head.size = sizeof in;
+    in.settings = blob(settings);
+    out.size = sizeof out;
+    head_ops()->refresh(inst, &in, &out);
+    why[0] = 0;
+    if (out.outcome == BB_MECH_Outcome_Ready) {
+        return 1;
+    }
+    snprintf(why, cap, "%.*s", (int)out.error.len, (const char *)out.error.ptr);
+    return 0;
+}
+
 /* resolve into the host's buffer `buf` (`buf_cap` bytes): the `out`, its error text in `why`. */
 static bb_secret_ResolveOut resolve_into(void *inst, const char *settings, uint8_t *buf,
                                          size_t buf_cap, char *why, size_t cap) {
@@ -234,7 +275,7 @@ static void settings_are_judged_whole(void) {
               strcmp(why, "settings: `values` is the only setting") == 0,
           "a setting other than `values` is refused naming why: '%s'", why);
     CHECK(!validate("{\"values\": {\"db\": \"\"}}", why, sizeof why) &&
-              strcmp(why, "settings: a `values` entry is empty; a secret must be non-empty") == 0,
+              strcmp(why, "settings: a `values` entry is EMPTY; a secret must be non-empty (fail-closed)") == 0,
           "an empty value is refused at validate: '%s'", why);
     /* 1025 bytes: one past the most a value may hold (MATERIAL_CAP). */
     strcpy(big_value, "{\"values\": {\"big\": \"");
@@ -267,12 +308,12 @@ static void references_name_only_a_non_empty_name(void) {
           "a known name resolves");
     CHECK(resolve(inst, "{\"name\": \"\"}", &kind, why, sizeof why) == BB_MECH_Outcome_Failed &&
               kind == BB_SECRET_ERROR_KIND_INVALID &&
-              strcmp(why, "resolve: `name` must be a non-empty string") == 0,
+              strcmp(why, "`name` in secret reference settings must not be blank") == 0,
           "an empty name is INVALID: kind=%u '%s'", kind, why);
     CHECK(resolve(inst, "{\"name\": \"db\", \"path\": \"/x\"}", &kind, why, sizeof why) ==
                   BB_MECH_Outcome_Failed &&
               kind == BB_SECRET_ERROR_KIND_INVALID &&
-              strcmp(why, "resolve: a reference names only `name`") == 0,
+              strcmp(why, "c secret reference names only settings.name (fail-closed)") == 0,
           "a reference naming another setting is INVALID: kind=%u '%s'", kind, why);
     close_instance(inst);
 }
@@ -422,12 +463,12 @@ static void a_reference_names_name_once_as_a_string(void) {
     }
     CHECK(resolve(inst, "{\"name\": 5}", &kind, why, sizeof why) == BB_MECH_Outcome_Failed &&
               kind == BB_SECRET_ERROR_KIND_INVALID &&
-              strcmp(why, "resolve: `name` must be a string") == 0,
+              strcmp(why, "missing or non-string `name` in secret reference settings") == 0,
           "a number for a name is INVALID: kind=%u '%s'", kind, why);
     CHECK(resolve(inst, "{\"name\": \"db\", \"name\": \"db\"}", &kind, why, sizeof why) ==
                   BB_MECH_Outcome_Failed &&
               kind == BB_SECRET_ERROR_KIND_INVALID &&
-              strcmp(why, "resolve: a reference names `name` once") == 0,
+              strcmp(why, "c secret reference names settings.name once (fail-closed)") == 0,
           "`name` twice is INVALID: kind=%u '%s'", kind, why);
     close_instance(inst);
 }
@@ -451,7 +492,7 @@ static void a_surrogate_pair_decodes_to_utf8(void) {
         close_instance(inst);
     }
     CHECK(!validate("{\"values\": {\"e\": \"\\ud83d\"}}", why, sizeof why) &&
-              strcmp(why, "settings must be one JSON object, nested at most 32 deep, with no "
+              strcmp(why, "settings: must be a JSON object; nested at most 32 deep, with no "
                           "unpaired \\u surrogate") == 0,
           "an unpaired high surrogate is refused naming why: '%s'", why);
     CHECK(!validate("{\"values\": {\"e\": \"\\ude00\"}}", why, sizeof why),
@@ -508,6 +549,173 @@ static void a_short_out_is_a_fault(void) {
     close_instance(inst);
 }
 
+
+#define NOT_OBJECT_TEXT                                                                            \
+    "settings: must be a JSON object; nested at most 32 deep, with no unpaired \\u surrogate"
+#define NONE_TEXT "settings: c requires settings (values); none provided"
+
+/* C4: instance settings of no bytes are refused saying a plugin requires them; a non-object says
+ * so in the shared grammar. validate, open and refresh alike. */
+static void instance_settings_use_the_shared_grammar(void) {
+    char why[256];
+    void *inst;
+    CHECK(!validate("", why, sizeof why) && strcmp(why, NONE_TEXT) == 0,
+          "validate: empty settings: '%s'", why);
+    CHECK(!open_text("", why, sizeof why) && strcmp(why, NONE_TEXT) == 0,
+          "open: empty settings: '%s'", why);
+    CHECK(!validate("[]", why, sizeof why) && strcmp(why, NOT_OBJECT_TEXT) == 0,
+          "validate: a non-object: '%s'", why);
+    CHECK(!open_text("[]", why, sizeof why) && strcmp(why, NOT_OBJECT_TEXT) == 0,
+          "open: a non-object: '%s'", why);
+    inst = open_instance("{\"values\": {\"db\": \"one\"}}");
+    CHECK(inst != 0, "opens");
+    if (inst != 0) {
+        CHECK(!refresh_text(inst, "", why, sizeof why) && strcmp(why, NONE_TEXT) == 0,
+              "refresh: empty settings: '%s'", why);
+        CHECK(!refresh_text(inst, "[]", why, sizeof why) && strcmp(why, NOT_OBJECT_TEXT) == 0,
+              "refresh: a non-object: '%s'", why);
+        close_instance(inst);
+    }
+}
+
+/* C1/C5: the reference refusals in the vault grammar (the kernel adds the module prefix), and an
+ * empty reference blob is `{}` (the SDK's settings_of). */
+static void reference_refusals_use_the_vault_grammar(void) {
+    char why[256];
+    uint32_t kind;
+    void *inst = open_instance("{\"values\": {\"db\": \"s3cr3t\"}}");
+    CHECK(inst != 0, "opens");
+    if (inst == 0) {
+        return;
+    }
+    CHECK(resolve(inst, "[]", &kind, why, sizeof why) == BB_MECH_Outcome_Failed &&
+              kind == BB_SECRET_ERROR_KIND_INVALID &&
+              strcmp(why, "secret settings are not a JSON object") == 0,
+          "a non-object reference: kind=%u '%s'", kind, why);
+    CHECK(resolve(inst, "", &kind, why, sizeof why) == BB_MECH_Outcome_Failed &&
+              kind == BB_SECRET_ERROR_KIND_INVALID &&
+              strcmp(why, "missing or non-string `name` in secret reference settings") == 0,
+          "an empty reference is {} (missing name): kind=%u '%s'", kind, why);
+    CHECK(resolve(inst, "{}", &kind, why, sizeof why) == BB_MECH_Outcome_Failed &&
+              kind == BB_SECRET_ERROR_KIND_INVALID &&
+              strcmp(why, "missing or non-string `name` in secret reference settings") == 0,
+          "{} is missing name: kind=%u '%s'", kind, why);
+    CHECK(resolve(inst, "{\"name\": \"nope\"}", &kind, why, sizeof why) == BB_MECH_Outcome_Failed &&
+              kind == BB_SECRET_ERROR_KIND_NOT_FOUND &&
+              strcmp(why, "c holds no secret by that name") == 0,
+          "an unknown name: kind=%u '%s'", kind, why);
+    close_instance(inst);
+}
+
+/* C2: the empty-material text carries the shared tail. validate refuses an empty value, so a kept
+ * `values` entry is made empty in place (same length, trailing blank) to reach resolve's guard. */
+static void resolve_refuses_empty_material_in_the_shared_words(void) {
+    char why[256];
+    uint32_t kind;
+    size_t len, k;
+    const char *from = "{\"values\": {\"db\": \" \"}}";
+    const char *to = "{\"values\": {\"db\": \"\"}} ";
+    uint8_t *mem;
+    void *inst = open_instance(from);
+    CHECK(inst != 0, "opens");
+    if (inst == 0) {
+        return;
+    }
+    mem = (uint8_t *)busbar_secret_c_instance(&len);
+    for (k = 0; k + strlen(from) <= len; k++) {
+        if (memcmp(mem + k, from, strlen(from)) == 0) {
+            memcpy(mem + k, to, strlen(to));
+            break;
+        }
+    }
+    CHECK(k + strlen(from) <= len, "found the kept settings");
+    CHECK(resolve(inst, "{\"name\": \"db\"}", &kind, why, sizeof why) == BB_MECH_Outcome_Failed &&
+              kind == BB_SECRET_ERROR_KIND_INVALID &&
+              strcmp(why, "the material is EMPTY; a secret must be non-empty (fail-closed)") == 0,
+          "an empty material: kind=%u '%s'", kind, why);
+    close_instance(inst);
+}
+
+/* C3: release is refused, SDK words first. */
+static void release_is_refused_in_the_sdk_words(void) {
+    bb_mech_ReleaseIn in;
+    bb_mech_OutHead out;
+    char why[256];
+    memset(&in, 0, sizeof in);
+    memset(&out, 0, sizeof out);
+    in.head.size = sizeof in;
+    in.lease = 1;
+    out.size = sizeof out;
+    CHECK(head_ops()->release(0, &in, &out) == BB_MECH_Outcome_Refused, "release is refused");
+    snprintf(why, sizeof why, "%.*s", (int)out.error.len, (const char *)out.error.ptr);
+    CHECK(strcmp(why, "release: no such lease (a resolved value is written into the host's "
+                      "buffer, never leased)") == 0,
+          "release text: '%s'", why);
+}
+
+/* C7: the Statement states its config word: one REWRITE_ALIAS from `secret-c`. */
+static void the_statement_states_its_alias(void) {
+    const bb_mech_Statement *st = busbar_plugin_door()->statement;
+    CHECK(st->rewrites != 0 && st->rewrites_len == 1, "one rewrite: len %llu",
+          (unsigned long long)st->rewrites_len);
+    if (st->rewrites != 0 && st->rewrites_len == 1) {
+        CHECK(st->rewrites[0].class_ == BB_MECH_REWRITE_ALIAS, "an alias rewrite");
+        CHECK(st->rewrites[0].from.len == 8 && memcmp(st->rewrites[0].from.ptr, "secret-c", 8) == 0,
+              "from is `secret-c`");
+        CHECK(st->rewrites[0].to.len == 0, "to is empty");
+    }
+}
+
+/* C6: an `out` shorter than its head (or NULL) is a FAULT at open, resolve, tick and cancel too. */
+static void a_short_out_is_a_fault_at_the_rest(void) {
+    bb_mech_OpenIn oin;
+    bb_mech_OpenOut oout;
+    bb_secret_ResolveIn rin;
+    bb_secret_ResolveOut rout;
+    bb_mech_TickOut tout;
+    bb_mech_CancelOut cout_;
+    uint8_t buf[64];
+    void *inst = open_instance("{\"values\": {\"db\": \"one\"}}");
+    CHECK(inst != 0, "opens");
+    if (inst == 0) {
+        return;
+    }
+    memset(&oin, 0, sizeof oin);
+    oin.head.size = sizeof oin;
+    oin.settings = blob("{\"values\": {\"db\": \"two\"}}");
+    oin.err_buf = buf;
+    oin.err_cap = sizeof buf;
+    memset(&oout, 0, sizeof oout);
+    oout.head.size = 4;
+    CHECK(head_ops()->open(0, &oin, &oout) == BB_MECH_Outcome_Fault && oout.err_len == 0,
+          "open: a short out is a FAULT");
+    CHECK(head_ops()->open(0, &oin, 0) == BB_MECH_Outcome_Fault, "open: a NULL out is a FAULT");
+    memset(&rin, 0, sizeof rin);
+    rin.head.size = sizeof rin;
+    rin.settings = blob("{\"name\": \"db\"}");
+    rin.secret_buf = buf;
+    rin.secret_cap = sizeof buf;
+    memset(&rout, 0, sizeof rout);
+    rout.head.size = 4;
+    CHECK(secret_ops()->resolve(inst, &rin, &rout) == BB_MECH_Outcome_Fault &&
+              rout.secret.len == 0 && buf[0] == 0,
+          "resolve: a short out is a FAULT, nothing written");
+    CHECK(secret_ops()->resolve(inst, &rin, 0) == BB_MECH_Outcome_Fault,
+          "resolve: a NULL out is a FAULT");
+    memset(&tout, 0, sizeof tout);
+    tout.head.size = 4;
+    CHECK(head_ops()->tick(inst, 0, &tout) == BB_MECH_Outcome_Fault && tout.head.outcome == 0,
+          "tick: a short out is a FAULT");
+    CHECK(head_ops()->tick(inst, 0, 0) == BB_MECH_Outcome_Fault, "tick: a NULL out is a FAULT");
+    memset(&cout_, 0, sizeof cout_);
+    cout_.head.size = 4;
+    CHECK(head_ops()->cancel(inst, 0, &cout_) == BB_MECH_Outcome_Fault && cout_.head.outcome == 0,
+          "cancel: a short out is a FAULT");
+    CHECK(head_ops()->cancel(inst, 0, 0) == BB_MECH_Outcome_Fault,
+          "cancel: a NULL out is a FAULT");
+    close_instance(inst);
+}
+
 int main(void) {
     a_resolve_leaves_no_copy_behind();
     a_value_over_the_buffer_is_the_short_answer();
@@ -520,6 +728,12 @@ int main(void) {
     a_reference_names_name_once_as_a_string();
     a_surrogate_pair_decodes_to_utf8();
     a_short_out_is_a_fault();
+    instance_settings_use_the_shared_grammar();
+    reference_refusals_use_the_vault_grammar();
+    resolve_refuses_empty_material_in_the_shared_words();
+    release_is_refused_in_the_sdk_words();
+    the_statement_states_its_alias();
+    a_short_out_is_a_fault_at_the_rest();
     if (failures) {
         fprintf(stderr, "%d failure(s)\n", failures);
         return 1;
