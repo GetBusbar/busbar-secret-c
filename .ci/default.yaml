@@ -242,7 +242,7 @@ env:
     [ "$PLUGIN_LANG" = c ] && step always "C: the kind's conformance through load_dropped" s_cconf
     exit $fail
 on:
-  move: [pin, linux]
+  move: [pin, linux, cunit]
 checks:
   pin:
     # ci / the busbar pin is one commit
