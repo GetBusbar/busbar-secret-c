@@ -3,8 +3,8 @@
  * Copyright (C) 2026 Busbar Inc and contributors
  *
  * busbar-secret-c's UNIT TESTS: the door driven directly, op by op, for what busbar's conformance
- * script does not judge (it judges the first `bad_settings` entry only, and one malformed
- * reference). This file is NOT part of the plugin: plugin-ci compiles the .c files in secret-c/ only, and this
+ * driver does not judge (it judges one malformed reference, and refreshes with good settings
+ * before it resolves after a refused refresh). This file is NOT part of the plugin: plugin-ci compiles the .c files in secret-c/ only, and this
  * directory is beside them. It uses libc and pthreads; the plugin uses neither.
  *
  * Run (from the repo root, with busbar_plugin.h from busbar at .busbar-ref):
@@ -236,15 +236,16 @@ static void settings_are_judged_whole(void) {
     CHECK(!validate("{\"values\": {\"db\": \"\"}}", why, sizeof why) &&
               strcmp(why, "settings: a `values` entry is empty; a secret must be non-empty") == 0,
           "an empty value is refused at validate: '%s'", why);
-    /* 1025 bytes: one past what a lease holds. */
+    /* 1025 bytes: one past the most a value may hold (MATERIAL_CAP). */
     strcpy(big_value, "{\"values\": {\"big\": \"");
     for (k = 0; k < 1025; k++) {
         strcat(big_value, "x");
     }
     strcat(big_value, "\"}}");
     CHECK(!validate(big_value, why, sizeof why) &&
-              strcmp(why, "settings: a `values` entry is larger than a lease holds (1024 bytes)") == 0,
-          "a value larger than a lease is refused at validate: '%s'", why);
+              strcmp(why, "settings: a `values` entry is larger than 1024 bytes, the most this "
+                          "plugin serves") == 0,
+          "a value over the cap is refused at validate: '%s'", why);
     {
         void *opened = open_instance(big_value);
         CHECK(opened == 0, "open refuses what validate refuses");
@@ -257,7 +258,7 @@ static void settings_are_judged_whole(void) {
 static void references_name_only_a_non_empty_name(void) {
     char why[256];
     uint32_t kind;
-    void *inst = open_instance("{\"values\": {\"db\": \"s3cr3t\", \"\": \"x\"}}");
+    void *inst = open_instance("{\"values\": {\"db\": \"s3cr3t\"}}");
     CHECK(inst != 0, "opens");
     if (inst == 0) {
         return;
@@ -278,10 +279,15 @@ static void references_name_only_a_non_empty_name(void) {
 
 /* refresh and resolve on the one instance from two threads: under -fsanitize=thread the old
  * unlocked instance reports a data race here; every resolve of a held name must be READY. */
+static int refused_refreshes;
+
 static void *refresher(void *inst) {
     int k;
     for (k = 0; k < 2000; k++) {
-        refresh(inst, (k & 1) ? "{\"values\": {\"db\": \"one\"}}" : "{\"values\": {\"db\": \"two\"}}");
+        if (!refresh(inst, (k & 1) ? "{\"values\": {\"db\": \"one\"}}"
+                                   : "{\"values\": {\"db\": \"two\"}}")) {
+            refused_refreshes++;
+        }
     }
     return 0;
 }
@@ -304,6 +310,201 @@ static void refresh_and_resolve_do_not_race(void) {
     }
     pthread_join(t, 0);
     CHECK(torn == 0, "%d resolves of a held name failed while refresh ran", torn);
+    CHECK(refused_refreshes == 0, "%d refreshes were refused: the race was never run",
+          refused_refreshes);
+    close_instance(inst);
+}
+
+/* A value of exactly MATERIAL_CAP bytes is served whole. */
+static char cap_value[1100];
+
+static void a_value_at_the_cap_is_served(void) {
+    char why[256];
+    static uint8_t buf[1024];
+    size_t k;
+    bb_secret_ResolveOut out;
+    void *inst;
+    strcpy(cap_value, "{\"values\": {\"cap\": \"");
+    for (k = 0; k < 1024; k++) {
+        strcat(cap_value, "y");
+    }
+    strcat(cap_value, "\"}}");
+    CHECK(validate(cap_value, why, sizeof why), "a 1024-byte value validates: '%s'", why);
+    inst = open_instance(cap_value);
+    CHECK(inst != 0, "a 1024-byte value opens");
+    if (inst == 0) {
+        return;
+    }
+    out = resolve_into(inst, "{\"name\": \"cap\"}", buf, sizeof buf, why, sizeof why);
+    CHECK(out.head.outcome == BB_MECH_Outcome_Ready && out.secret.len == 1024 && buf[0] == 'y' &&
+              buf[1023] == 'y',
+          "a 1024-byte value resolves whole: outcome %u len %llu '%s'", out.head.outcome,
+          (unsigned long long)out.secret.len, why);
+    memset(buf, 0, sizeof buf);
+    close_instance(inst);
+}
+
+/* Every name in `values` can be asked for: an empty one, one longer than a name may be, a name
+ * given twice and `values` given twice are refused at validate, open and refresh alike, never kept
+ * where no reference can reach them. */
+static char long_name[1100];
+
+static void every_kept_name_can_be_resolved(void) {
+    char why[256];
+    size_t k;
+    void *inst;
+    CHECK(!validate("{\"values\": {\"a\": \"x\"}, \"values\": {\"b\": \"y\"}}", why, sizeof why) &&
+              strcmp(why, "settings: `values` is given more than once") == 0,
+          "`values` twice is refused: '%s'", why);
+    CHECK(!validate("{\"values\": {\"\": \"x\"}}", why, sizeof why) &&
+              strcmp(why, "settings: a `values` name is empty") == 0,
+          "an empty name is refused: '%s'", why);
+    CHECK(!validate("{\"values\": {\"a\": \"x\", \"b\": \"y\", \"a\": \"z\"}}", why, sizeof why) &&
+              strcmp(why, "settings: a `values` name is given more than once") == 0,
+          "a name twice is refused: '%s'", why);
+    CHECK(!validate("{\"values\": {\"a\": \"x\", \"\\u0061\": \"z\"}}", why, sizeof why) &&
+              strcmp(why, "settings: a `values` name is given more than once") == 0,
+          "a name twice, once escaped, is refused: '%s'", why);
+    CHECK(validate("{\"values\": {\"a\": \"x\", \"ab\": \"y\", \"b\": \"z\"}}", why, sizeof why),
+          "distinct names validate: '%s'", why);
+    strcpy(long_name, "{\"values\": {\"");
+    for (k = 0; k < 1025; k++) {
+        strcat(long_name, "n");
+    }
+    strcat(long_name, "\": \"x\"}}");
+    CHECK(!validate(long_name, why, sizeof why) &&
+              strcmp(why, "settings: a `values` name is longer than 1024 bytes, the most a "
+                          "reference may name") == 0,
+          "a name over the cap is refused: '%s'", why);
+    inst = open_instance("{\"values\": {\"db\": \"one\"}}");
+    CHECK(inst != 0, "opens");
+    if (inst == 0) {
+        return;
+    }
+    CHECK(!refresh(inst, "{\"values\": {\"db\": \"one\", \"db\": \"two\"}}"),
+          "refresh refuses a name given twice");
+    close_instance(inst);
+    inst = open_instance("{\"values\": {\"\": \"x\"}}");
+    CHECK(inst == 0, "open refuses an empty name");
+    if (inst != 0) {
+        close_instance(inst);
+    }
+}
+
+/* A refused refresh keeps the instance serving what it served. */
+static void a_refused_refresh_keeps_the_old_values(void) {
+    char why[256];
+    uint8_t buf[64];
+    bb_secret_ResolveOut out;
+    void *inst = open_instance("{\"values\": {\"db\": \"one\"}}");
+    CHECK(inst != 0, "opens");
+    if (inst == 0) {
+        return;
+    }
+    CHECK(!refresh(inst, "{\"values\": {\"db\": \"\"}}"), "an empty value is refused at refresh");
+    memset(buf, 0, sizeof buf);
+    out = resolve_into(inst, "{\"name\": \"db\"}", buf, sizeof buf, why, sizeof why);
+    CHECK(out.head.outcome == BB_MECH_Outcome_Ready && out.secret.len == 3 &&
+              memcmp(buf, "one", 3) == 0,
+          "the refused refresh kept the old value: '%s'", why);
+    memset(buf, 0, sizeof buf);
+    close_instance(inst);
+}
+
+/* A reference names `name` once, as a string. */
+static void a_reference_names_name_once_as_a_string(void) {
+    char why[256];
+    uint32_t kind;
+    void *inst = open_instance("{\"values\": {\"db\": \"one\"}}");
+    CHECK(inst != 0, "opens");
+    if (inst == 0) {
+        return;
+    }
+    CHECK(resolve(inst, "{\"name\": 5}", &kind, why, sizeof why) == BB_MECH_Outcome_Failed &&
+              kind == BB_SECRET_ERROR_KIND_INVALID &&
+              strcmp(why, "resolve: `name` must be a string") == 0,
+          "a number for a name is INVALID: kind=%u '%s'", kind, why);
+    CHECK(resolve(inst, "{\"name\": \"db\", \"name\": \"db\"}", &kind, why, sizeof why) ==
+                  BB_MECH_Outcome_Failed &&
+              kind == BB_SECRET_ERROR_KIND_INVALID &&
+              strcmp(why, "resolve: a reference names `name` once") == 0,
+          "`name` twice is INVALID: kind=%u '%s'", kind, why);
+    close_instance(inst);
+}
+
+/* RFC 8259 section 7: a character outside the Basic Multilingual Plane is escaped as a surrogate
+ * pair; it decodes to its 4-byte UTF-8. An unpaired surrogate is refused, saying so. */
+static void a_surrogate_pair_decodes_to_utf8(void) {
+    char why[256];
+    uint8_t buf[64];
+    bb_secret_ResolveOut out;
+    void *inst = open_instance("{\"values\": {\"e\": \"a\\ud83d\\ude00b\"}}");
+    CHECK(inst != 0, "a surrogate pair opens");
+    if (inst != 0) {
+        memset(buf, 0, sizeof buf);
+        out = resolve_into(inst, "{\"name\": \"e\"}", buf, sizeof buf, why, sizeof why);
+        CHECK(out.head.outcome == BB_MECH_Outcome_Ready && out.secret.len == 6 &&
+                  memcmp(buf, "a\xF0\x9F\x98\x80" "b", 6) == 0,
+              "the pair decodes to U+1F600's UTF-8: outcome %u len %llu '%s'", out.head.outcome,
+              (unsigned long long)out.secret.len, why);
+        memset(buf, 0, sizeof buf);
+        close_instance(inst);
+    }
+    CHECK(!validate("{\"values\": {\"e\": \"\\ud83d\"}}", why, sizeof why) &&
+              strcmp(why, "settings must be one JSON object, nested at most 32 deep, with no "
+                          "unpaired \\u surrogate") == 0,
+          "an unpaired high surrogate is refused naming why: '%s'", why);
+    CHECK(!validate("{\"values\": {\"e\": \"\\ude00\"}}", why, sizeof why),
+          "an unpaired low surrogate is refused");
+    CHECK(!validate("{\"values\": {\"e\": \"\\ud83d\\u0041\"}}", why, sizeof why),
+          "a high surrogate followed by a non-surrogate is refused");
+}
+
+/* An `out` shorter than its head is a FAULT, written nothing, at every op (as `check` answers). */
+static void a_short_out_is_a_fault(void) {
+    bb_mech_ValidateIn vin;
+    bb_mech_RefreshIn rin;
+    bb_mech_ReleaseIn lin;
+    bb_mech_OutHead out;
+    uint8_t buf[64];
+    void *inst = open_instance("{\"values\": {\"db\": \"one\"}}");
+    CHECK(inst != 0, "opens");
+    if (inst == 0) {
+        return;
+    }
+    memset(&vin, 0, sizeof vin);
+    vin.head.size = sizeof vin;
+    vin.settings = blob("[]");
+    vin.err_buf = buf;
+    vin.err_cap = sizeof buf;
+    memset(&out, 0, sizeof out);
+    out.size = 4;
+    CHECK(head_ops()->validate(0, &vin, &out) == BB_MECH_Outcome_Fault && out.error.len == 0 &&
+              out.outcome == 0,
+          "validate: a short out is a FAULT");
+    memset(&rin, 0, sizeof rin);
+    rin.head.size = sizeof rin;
+    rin.settings = blob("[]");
+    memset(&out, 0, sizeof out);
+    out.size = 4;
+    CHECK(head_ops()->refresh(inst, &rin, &out) == BB_MECH_Outcome_Fault && out.error.len == 0,
+          "refresh: a short out is a FAULT");
+    memset(&lin, 0, sizeof lin);
+    lin.head.size = sizeof lin;
+    lin.lease = 1;
+    memset(&out, 0, sizeof out);
+    out.size = 4;
+    CHECK(head_ops()->release(inst, &lin, &out) == BB_MECH_Outcome_Fault && out.error.len == 0,
+          "release: a short out is a FAULT");
+    memset(&out, 0, sizeof out);
+    out.size = 4;
+    CHECK(head_ops()->retire(inst, 0, &out) == BB_MECH_Outcome_Fault && out.outcome == 0,
+          "retire: a short out is a FAULT");
+    memset(&out, 0, sizeof out);
+    out.size = 4;
+    CHECK(head_ops()->close(inst, 0, &out) == BB_MECH_Outcome_Fault && out.outcome == 0,
+          "close: a short out is a FAULT");
+    CHECK(held_copies("one") == 1, "a faulted close left the instance as it was");
     close_instance(inst);
 }
 
@@ -313,6 +514,12 @@ int main(void) {
     settings_are_judged_whole();
     references_name_only_a_non_empty_name();
     refresh_and_resolve_do_not_race();
+    a_value_at_the_cap_is_served();
+    every_kept_name_can_be_resolved();
+    a_refused_refresh_keeps_the_old_values();
+    a_reference_names_name_once_as_a_string();
+    a_surrogate_pair_decodes_to_utf8();
+    a_short_out_is_a_fault();
     if (failures) {
         fprintf(stderr, "%d failure(s)\n", failures);
         return 1;
