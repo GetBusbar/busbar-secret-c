@@ -22,6 +22,7 @@
 #include "busbar_plugin.h"
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -320,40 +321,75 @@ static void references_name_only_a_non_empty_name(void) {
 
 /* refresh and resolve on the one instance from two threads: under -fsanitize=thread the old
  * unlocked instance reports a data race here; every resolve of a held name must be READY. */
+enum { RACE_ITERATIONS = 2000 };
+static atomic_int refresher_started;
+static atomic_int refresher_go;
+static atomic_int refresher_completed;
+static int attempted_refreshes;
 static int refused_refreshes;
 
 static void *refresher(void *inst) {
     int k;
-    for (k = 0; k < 2000; k++) {
+    atomic_store_explicit(&refresher_started, 1, memory_order_release);
+    while (!atomic_load_explicit(&refresher_go, memory_order_acquire)) {
+    }
+    for (k = 0; k < RACE_ITERATIONS; k++) {
+        attempted_refreshes++;
         if (!refresh(inst, (k & 1) ? "{\"values\": {\"db\": \"one\"}}"
                                    : "{\"values\": {\"db\": \"two\"}}")) {
             refused_refreshes++;
         }
     }
+    atomic_store_explicit(&refresher_completed, 1, memory_order_release);
     return 0;
 }
 
-static void refresh_and_resolve_do_not_race(void) {
+static int refresh_and_resolve_do_not_race(void) {
     pthread_t t;
     char why[256];
     uint32_t kind;
-    int k, torn = 0;
+    int k, status, torn = 0;
     void *inst = open_instance("{\"values\": {\"db\": \"one\"}}");
     CHECK(inst != 0, "opens");
     if (inst == 0) {
-        return;
+        return 0;
     }
-    pthread_create(&t, 0, refresher, inst);
-    for (k = 0; k < 2000; k++) {
+    atomic_store_explicit(&refresher_started, 0, memory_order_relaxed);
+    atomic_store_explicit(&refresher_go, 0, memory_order_relaxed);
+    atomic_store_explicit(&refresher_completed, 0, memory_order_relaxed);
+    attempted_refreshes = 0;
+    refused_refreshes = 0;
+    status = pthread_create(&t, 0, refresher, inst);
+    CHECK(status == 0, "pthread_create: %s", strerror(status));
+    if (status != 0) {
+        close_instance(inst);
+        return 0;
+    }
+    while (!atomic_load_explicit(&refresher_started, memory_order_acquire)) {
+    }
+    atomic_store_explicit(&refresher_go, 1, memory_order_release);
+    for (k = 0; k < RACE_ITERATIONS; k++) {
         if (resolve(inst, "{\"name\": \"db\"}", &kind, why, sizeof why) != BB_MECH_Outcome_Ready) {
             torn++;
         }
     }
-    pthread_join(t, 0);
+    status = pthread_join(t, 0);
+    CHECK(status == 0, "pthread_join: %s", strerror(status));
+    if (status != 0) {
+        /* The worker may still own inst: main must exit before more plugin operations. */
+        return 0;
+    }
+    CHECK(atomic_load_explicit(&refresher_started, memory_order_acquire) == 1,
+          "the refresh worker never started");
+    CHECK(atomic_load_explicit(&refresher_completed, memory_order_acquire) == 1,
+          "the refresh worker never completed");
+    CHECK(attempted_refreshes == RACE_ITERATIONS, "%d of %d refreshes ran",
+          attempted_refreshes, RACE_ITERATIONS);
     CHECK(torn == 0, "%d resolves of a held name failed while refresh ran", torn);
     CHECK(refused_refreshes == 0, "%d refreshes were refused: the race was never run",
           refused_refreshes);
     close_instance(inst);
+    return 1;
 }
 
 /* A value of exactly MATERIAL_CAP bytes is served whole. */
@@ -717,12 +753,246 @@ static void a_short_out_is_a_fault_at_the_rest(void) {
     close_instance(inst);
 }
 
+/* The following cases call the existing public door, including all three settings entry points. */
+static void refused_settings_everywhere(const char *settings, const char *expected) {
+    char why[256];
+    void *inst;
+    CHECK(!validate(settings, why, sizeof why) && strcmp(why, expected) == 0,
+          "validate refusal: '%s'", why);
+    CHECK(!open_text(settings, why, sizeof why) && strcmp(why, expected) == 0,
+          "open refusal: '%s'", why);
+    inst = open_instance("{\"values\":{\"db\":\"unchanged\"}}");
+    CHECK(inst != 0, "opens for a refused refresh");
+    if (inst != 0) {
+        CHECK(!refresh_text(inst, settings, why, sizeof why) && strcmp(why, expected) == 0,
+              "refresh refusal: '%s'", why);
+        close_instance(inst);
+    }
+}
+
+static void serves_bytes(void *inst, const char *reference, const uint8_t *expected, size_t len) {
+    char why[256];
+    uint8_t buf[1024];
+    bb_secret_ResolveOut out;
+    memset(buf, 0, sizeof buf);
+    out = resolve_into(inst, reference, buf, sizeof buf, why, sizeof why);
+    CHECK(out.head.outcome == BB_MECH_Outcome_Ready && out.secret.ptr == buf &&
+              out.secret.len == len && len <= sizeof buf && memcmp(buf, expected, len) == 0,
+          "resolved bytes differ: outcome %u len %llu '%s'", out.head.outcome,
+          (unsigned long long)out.secret.len, why);
+    memset(buf, 0, sizeof buf);
+}
+
+static void good_shorter_refresh_replaces_material_and_clears_the_old_tail(void) {
+    void *inst = open_instance("{\"values\":{\"db\":\"prefix-prefix-prefix-prefix-OLD-TAIL-CANARY-c-7f3e\"}}");
+    CHECK(inst != 0, "opens for rotation");
+    if (inst == 0) {
+        return;
+    }
+    CHECK(held_copies("OLD-TAIL-CANARY-c-7f3e") == 1, "old material starts in kept settings");
+    CHECK(refresh(inst, "{\"values\":{\"db\":\"x\"}}"), "a good shorter refresh succeeds");
+    serves_bytes(inst, "{\"name\":\"db\"}", (const uint8_t *)"x", 1);
+    CHECK(held_copies("OLD-TAIL-CANARY-c-7f3e") == 0,
+          "refresh must wipe the old settings tail before copying shorter settings");
+    close_instance(inst);
+}
+
+static void prefix_and_escaped_names_resolve_their_own_material(void) {
+    void *inst = open_instance("{\"values\":{\"ab\":\"AB\",\"a\":\"A\",\"b\":\"B\",\"e\\u0073c\":\"E\"}}");
+    CHECK(inst != 0, "prefix and escaped names open");
+    if (inst == 0) {
+        return;
+    }
+    serves_bytes(inst, "{\"name\":\"a\"}", (const uint8_t *)"A", 1);
+    serves_bytes(inst, "{\"name\":\"ab\"}", (const uint8_t *)"AB", 2);
+    serves_bytes(inst, "{\"name\":\"b\"}", (const uint8_t *)"B", 1);
+    serves_bytes(inst, "{\"name\":\"\\u0061\"}", (const uint8_t *)"A", 1);
+    serves_bytes(inst, "{\"name\":\"esc\"}", (const uint8_t *)"E", 1);
+    serves_bytes(inst, "{\"name\":\"e\\u0073c\"}", (const uint8_t *)"E", 1);
+    close_instance(inst);
+}
+
+static void names_at_and_beyond_the_existing_cap(void) {
+    char settings[1100], reference[1100], why[256];
+    size_t start, k;
+    uint32_t kind;
+    void *inst;
+    strcpy(settings, "{\"values\":{\"");
+    start = strlen(settings);
+    memset(settings + start, 'n', 1024);
+    strcpy(settings + start + 1024, "\":\"x\"}}");
+    CHECK(validate(settings, why, sizeof why), "a 1024-byte name validates: '%s'", why);
+    inst = open_instance(settings);
+    CHECK(inst != 0, "a 1024-byte name opens");
+    if (inst == 0) {
+        return;
+    }
+    strcpy(reference, "{\"name\":\"");
+    start = strlen(reference);
+    for (k = 0; k < 1024; k++) {
+        reference[start + k] = 'n';
+    }
+    strcpy(reference + start + 1024, "\"}");
+    serves_bytes(inst, reference, (const uint8_t *)"x", 1);
+    reference[start + 1024] = 'n';
+    strcpy(reference + start + 1025, "\"}");
+    CHECK(resolve(inst, reference, &kind, why, sizeof why) == BB_MECH_Outcome_Failed &&
+              kind == BB_SECRET_ERROR_KIND_NOT_FOUND && strcmp(why, "c holds no secret by that name") == 0,
+          "a well-formed 1025-byte reference is NOT_FOUND: kind=%u '%s'", kind, why);
+    close_instance(inst);
+}
+
+static void settings_at_the_existing_cap_and_diagnostic_boundaries(void) {
+    static char settings[8194];
+    char why[256];
+    size_t start;
+    void *inst;
+    strcpy(settings, "{\"values\":{\"db\":\"x\"}}");
+    start = strlen(settings);
+    memset(settings + start, ' ', 8192 - start);
+    settings[8192] = 0;
+    CHECK(validate(settings, why, sizeof why), "8192-byte settings validate: '%s'", why);
+    inst = open_instance(settings);
+    CHECK(inst != 0, "8192-byte settings open");
+    if (inst != 0) {
+        CHECK(refresh(inst, settings), "8192-byte settings refresh");
+        serves_bytes(inst, "{\"name\":\"db\"}", (const uint8_t *)"x", 1);
+        close_instance(inst);
+    }
+    settings[8192] = ' ';
+    settings[8193] = 0;
+    refused_settings_everywhere(settings,
+        "settings: larger than 8192 bytes, the most this plugin keeps");
+    refused_settings_everywhere("{}", "settings: `values` is required");
+    refused_settings_everywhere("{\"values\":{\"db\":\"x\"}} trailing", NOT_OBJECT_TEXT);
+}
+
+static void nested_extra(char *text, const char *prefix, size_t arrays) {
+    size_t k, n;
+    strcpy(text, prefix);
+    n = strlen(text);
+    for (k = 0; k < arrays; k++) text[n++] = '[';
+    text[n++] = '0';
+    for (k = 0; k < arrays; k++) text[n++] = ']';
+    text[n++] = '}';
+    text[n] = 0;
+}
+
+#define BAD_REFERENCE_OBJECT_TEXT \
+    "secret reference settings must be well-formed JSON, nested at most 32 deep, with no unpaired \\u surrogate"
+
+static void depth_and_malformed_reference_diagnostics_name_the_cause(void) {
+    char text[256], why[256];
+    uint32_t kind;
+    size_t k;
+    const char *bad[] = { "{\"name\":\"\\ud800\"}", "{\"name\":\"\\udc00\"}",
+                          "{\"name\":\"db\"} trailing", "{\"name\":\"\\q\"}" };
+    void *inst;
+    /* Root object depth is zero: 31 arrays put their scalar at 32; 32 put it at 33. */
+    nested_extra(text, "{\"values\":{},\"extra\":", 31);
+    refused_settings_everywhere(text, "settings: `values` is the only setting");
+    nested_extra(text, "{\"values\":{},\"extra\":", 32);
+    refused_settings_everywhere(text, NOT_OBJECT_TEXT);
+    inst = open_instance("{\"values\":{\"db\":\"x\"}}");
+    CHECK(inst != 0, "opens for malformed references");
+    if (inst == 0) {
+        return;
+    }
+    nested_extra(text, "{\"name\":\"db\",\"extra\":", 31);
+    CHECK(resolve(inst, text, &kind, why, sizeof why) == BB_MECH_Outcome_Failed &&
+              kind == BB_SECRET_ERROR_KIND_INVALID &&
+              strcmp(why, "c secret reference names only settings.name (fail-closed)") == 0,
+          "depth 32 parsed before the extra-member refusal: '%s'", why);
+    nested_extra(text, "{\"name\":\"db\",\"extra\":", 32);
+    CHECK(resolve(inst, text, &kind, why, sizeof why) == BB_MECH_Outcome_Failed &&
+              kind == BB_SECRET_ERROR_KIND_INVALID && strcmp(why, BAD_REFERENCE_OBJECT_TEXT) == 0,
+          "depth 33 names the parser restriction: '%s'", why);
+    for (k = 0; k < sizeof bad / sizeof bad[0]; k++) {
+        CHECK(resolve(inst, bad[k], &kind, why, sizeof why) == BB_MECH_Outcome_Failed &&
+                  kind == BB_SECRET_ERROR_KIND_INVALID && strcmp(why, BAD_REFERENCE_OBJECT_TEXT) == 0,
+              "malformed object reference names parser restrictions: '%s'", why);
+    }
+    close_instance(inst);
+}
+
+static void every_escape_class_decodes_into_the_host_buffer(void) {
+    static const struct {
+        const char *json;
+        const char *bytes;
+        size_t len;
+    } cases[] = {
+        { "\\n", "\n", 1 }, { "\\t", "\t", 1 }, { "\\\"", "\"", 1 },
+        { "\\\\", "\\", 1 }, { "\\/", "/", 1 }, { "\\b", "\b", 1 },
+        { "\\f", "\f", 1 }, { "\\r", "\r", 1 }, { "\\u00e9", "\xC3\xA9", 2 },
+        { "\\u20ac", "\xE2\x82\xAC", 3 }, { "\\u0000", "\0", 1 },
+        { "caf\xC3\xA9", "caf\xC3\xA9", 5 },
+        { "\\ud83d\\ude00", "\xF0\x9F\x98\x80", 4 },
+    };
+    char settings[128];
+    size_t k;
+    for (k = 0; k < sizeof cases / sizeof cases[0]; k++) {
+        void *inst;
+        snprintf(settings, sizeof settings, "{\"values\":{\"db\":\"%s\"}}", cases[k].json);
+        inst = open_instance(settings);
+        CHECK(inst != 0, "escape class %llu opens", (unsigned long long)k);
+        if (inst != 0) {
+            serves_bytes(inst, "{\"name\":\"db\"}", (const uint8_t *)cases[k].bytes, cases[k].len);
+            close_instance(inst);
+        }
+    }
+}
+
+static void a_second_open_keeps_the_first_instance_and_check_stays_unserved(void) {
+    bb_mech_OpenIn in;
+    bb_mech_OpenOut out;
+    bb_secret_CheckIn check;
+    bb_mech_OutHead checked, before;
+    uint8_t why[256];
+    void *inst = open_instance("{\"values\":{\"db\":\"first\"}}");
+    CHECK(inst != 0, "first open succeeds");
+    if (inst == 0) {
+        return;
+    }
+    memset(&in, 0, sizeof in);
+    memset(&out, 0, sizeof out);
+    memset(why, 0, sizeof why);
+    in.head.size = sizeof in;
+    in.settings = blob("{\"values\":{\"db\":\"second\"}}");
+    in.err_buf = why;
+    in.err_cap = sizeof why;
+    out.head.size = sizeof out;
+    CHECK(head_ops()->open(0, &in, &out) == BB_MECH_Outcome_Failed &&
+              out.err_len == strlen("one instance only") &&
+              memcmp(why, "one instance only", strlen("one instance only")) == 0,
+          "second open fails with the singleton reason");
+    serves_bytes(inst, "{\"name\":\"db\"}", (const uint8_t *)"first", 5);
+    memset(&check, 0, sizeof check);
+    check.head.size = sizeof check;
+    memset(&checked, 0, sizeof checked);
+    checked.size = sizeof checked;
+    CHECK(secret_ops()->check(inst, &check, &checked) == BB_MECH_Outcome_Refused &&
+              checked.outcome == BB_MECH_Outcome_Refused, "check remains unserved");
+    memset(&checked, 0, sizeof checked);
+    checked.size = sizeof checked;
+    CHECK(secret_ops()->check(inst, 0, &checked) == BB_MECH_Outcome_Fault &&
+              checked.outcome == BB_MECH_Outcome_Fault, "check NULL in faults");
+    memset(&checked, 0, sizeof checked);
+    checked.size = 4;
+    memcpy(&before, &checked, sizeof before);
+    CHECK(secret_ops()->check(inst, &check, &checked) == BB_MECH_Outcome_Fault &&
+              memcmp(&checked, &before, sizeof checked) == 0, "short check out is untouched");
+    CHECK(secret_ops()->check(inst, &check, 0) == BB_MECH_Outcome_Fault, "check NULL out faults");
+    close_instance(inst);
+}
+
 int main(void) {
     a_resolve_leaves_no_copy_behind();
     a_value_over_the_buffer_is_the_short_answer();
     settings_are_judged_whole();
     references_name_only_a_non_empty_name();
-    refresh_and_resolve_do_not_race();
+    if (!refresh_and_resolve_do_not_race()) {
+        return 1;
+    }
     a_value_at_the_cap_is_served();
     every_kept_name_can_be_resolved();
     a_refused_refresh_keeps_the_old_values();
@@ -735,6 +1005,13 @@ int main(void) {
     release_is_refused_in_the_sdk_words();
     the_statement_states_its_alias();
     a_short_out_is_a_fault_at_the_rest();
+    good_shorter_refresh_replaces_material_and_clears_the_old_tail();
+    prefix_and_escaped_names_resolve_their_own_material();
+    names_at_and_beyond_the_existing_cap();
+    settings_at_the_existing_cap_and_diagnostic_boundaries();
+    depth_and_malformed_reference_diagnostics_name_the_cause();
+    every_escape_class_decodes_into_the_host_buffer();
+    a_second_open_keeps_the_first_instance_and_check_stays_unserved();
     if (failures) {
         fprintf(stderr, "%d failure(s)\n", failures);
         return 1;
