@@ -1012,12 +1012,12 @@ _Static_assert(offsetof(bb_mech_Door, layout) == 56 && sizeof(bb_mech_Door) == 6
                "the door states its layout fingerprint at offset 56 of a 64-byte door");
 
 #ifdef BUSBAR_SECRET_C_UNIT
-/* TEST ONLY (tests/unit.c, never in a plugin build): the one instance's memory, so a unit case can
- * prove what it holds. */
+/* TEST ONLY (tests/unit.c, never in a plugin build): only the initialized byte array owned by
+ * the instance. No struct representation or padding is lent to the observer. */
 const void *busbar_secret_c_instance(size_t *len);
 const void *busbar_secret_c_instance(size_t *len) {
-    *len = sizeof THE_INSTANCE;
-    return &THE_INSTANCE;
+    *len = THE_INSTANCE.settings_len;
+    return THE_INSTANCE.settings;
 }
 #endif
 

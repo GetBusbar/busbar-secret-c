@@ -195,12 +195,18 @@ static int resolve(void *inst, const char *settings, uint32_t *kind, char *why, 
     return out.head.outcome;
 }
 
-/* How many times `needle` occurs in the plugin's one instance's memory. */
+/* Register only the instance's written settings prefix. This static byte owner stays live and
+ * initialized across refresh/close, so the previously registered prefix can witness its wipe.
+ * Neither the instance representation nor the array's unwritten capacity is scanned. */
 static int held_copies(const char *needle) {
+    static size_t initialized_len;
     size_t len, n = strlen(needle), k;
     const uint8_t *mem = busbar_secret_c_instance(&len);
     int copies = 0;
-    for (k = 0; k + n <= len; k++) {
+    if (len > initialized_len) {
+        initialized_len = len;
+    }
+    for (k = 0; k + n <= initialized_len; k++) {
         if (memcmp(mem + k, needle, n) == 0) {
             copies++;
         }
@@ -985,6 +991,335 @@ static void a_second_open_keeps_the_first_instance_and_check_stays_unserved(void
     close_instance(inst);
 }
 
+/* Search only the bytes a door answer lends, including non-NUL-terminated error text. */
+static int text_contains(const uint8_t *text, size_t len, const char *needle) {
+    size_t n = strlen(needle), k;
+    if (text == 0 || n > len) {
+        return 0;
+    }
+    for (k = 0; k <= len - n; k++) {
+        if (memcmp(text + k, needle, n) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+#define REJECTED_MATERIAL "REFUSED-CREDENTIAL-c-7f3e"
+
+static void refusal_contains_no_credential(const bb_mech_OutHead *head, const uint8_t *reason,
+                                          size_t reason_len) {
+    static const char *const spellings[] = {
+        REJECTED_MATERIAL, "REFUSED-CREDENTIAL", "k\\u00e9y", "k\xC3\xA9y"
+    };
+    size_t k;
+    CHECK(head->error.ptr != 0 || head->error.len == 0, "an error length needs error bytes");
+    for (k = 0; k < sizeof spellings / sizeof spellings[0]; k++) {
+        CHECK(!text_contains(head->error.ptr, head->error.len, spellings[k]),
+              "head.error disclosed a configured credential spelling");
+        CHECK(!text_contains(reason, reason_len, spellings[k]),
+              "the lent reason buffer disclosed a configured credential spelling");
+    }
+}
+
+/* Valid material precedes each error: every settings entry point must refuse without echoing
+ * that material or retaining the rejected candidate, and a refused refresh must keep serving old
+ * bytes. These are coverage controls through the existing ABI, not a claimed baseline RED. */
+static void refused_candidates_are_not_echoed_or_kept(void) {
+    static const struct {
+        const char *settings;
+        const char *why;
+    } cases[] = {
+        { "{\"values\":{\"db\":\"" REJECTED_MATERIAL "\",\"api\":\"k\\u00e9y\",\"bad\":7}}",
+          "settings: every `values` entry must be a string" },
+        { "{\"values\":{\"db\":\"" REJECTED_MATERIAL "\",\"api\":\"k\\u00e9y\"},\"values\":{}}",
+          "settings: `values` is given more than once" },
+        { "{\"values\":{\"db\":\"" REJECTED_MATERIAL "\",\"api\":\"k\\u00e9y\",\"db\":\"other\"}}",
+          "settings: a `values` name is given more than once" },
+        { "{\"values\":{\"db\":\"" REJECTED_MATERIAL "\",\"api\":\"k\\u00e9y\",\"empty\":\"\"}}",
+          "settings: a `values` entry is EMPTY; a secret must be non-empty (fail-closed)" },
+        { "{\"values\":{\"db\":\"" REJECTED_MATERIAL "\",\"api\":\"k\\u00e9y\"},\"extra\":{}}",
+          "settings: `values` is the only setting" },
+    };
+    static const uint8_t planted[] = "before " REJECTED_MATERIAL " after";
+    uint8_t reason[256];
+    size_t k;
+    CHECK(text_contains(planted, sizeof planted - 1, REJECTED_MATERIAL),
+          "the leak search must detect planted credential bytes");
+    CHECK(text_contains((const uint8_t *)"k\\u00e9y", 8, "k\\u00e9y") &&
+              text_contains((const uint8_t *)"k\xC3\xA9y", 4, "k\xC3\xA9y"),
+          "the leak search must detect raw escaped and decoded spellings");
+    CHECK(!text_contains((const uint8_t *)"static refusal", 14, REJECTED_MATERIAL),
+          "the leak search must allow an unrelated static refusal");
+    for (k = 0; k < sizeof cases / sizeof cases[0]; k++) {
+        bb_mech_ValidateIn validate_in;
+        bb_mech_OpenIn open_in;
+        bb_mech_RefreshIn refresh_in;
+        bb_mech_OutHead validated, refreshed;
+        bb_mech_OpenOut opened;
+        bb_mech_RawOutcome outcome;
+        size_t n = strlen(cases[k].why);
+        void *inst;
+        memset(&validate_in, 0, sizeof validate_in);
+        memset(&validated, 0, sizeof validated);
+        memset(reason, 0xA5, sizeof reason);
+        validate_in.head.size = sizeof validate_in;
+        validate_in.settings = blob(cases[k].settings);
+        validate_in.err_buf = reason;
+        validate_in.err_cap = sizeof reason;
+        validated.size = sizeof validated;
+        outcome = head_ops()->validate(0, &validate_in, &validated);
+        CHECK(outcome == BB_MECH_Outcome_Failed && validated.outcome == outcome &&
+                  validated.error.ptr == reason && validated.error.len == n &&
+                  n <= sizeof reason && memcmp(reason, cases[k].why, n) == 0,
+              "credential-bearing validate must fail with its specific static reason");
+        refusal_contains_no_credential(&validated, reason, sizeof reason);
+        CHECK(held_copies(REJECTED_MATERIAL) == 0, "validate retained a rejected candidate");
+
+        memset(&open_in, 0, sizeof open_in);
+        memset(&opened, 0, sizeof opened);
+        memset(reason, 0xA5, sizeof reason);
+        open_in.head.size = sizeof open_in;
+        open_in.settings = blob(cases[k].settings);
+        open_in.err_buf = reason;
+        open_in.err_cap = sizeof reason;
+        opened.head.size = sizeof opened;
+        outcome = head_ops()->open(0, &open_in, &opened);
+        CHECK(outcome == BB_MECH_Outcome_Failed && opened.head.outcome == outcome &&
+                  opened.instance == 0 && opened.err_len == n && n <= sizeof reason &&
+                  memcmp(reason, cases[k].why, n) == 0,
+              "credential-bearing open must fail with its specific static reason");
+        refusal_contains_no_credential(&opened.head, reason, sizeof reason);
+        CHECK(held_copies(REJECTED_MATERIAL) == 0, "open retained a rejected candidate");
+        if (outcome == BB_MECH_Outcome_Ready && opened.instance != 0) {
+            close_instance(opened.instance);
+        }
+
+        inst = open_instance("{\"values\":{\"db\":\"old-material\"}}");
+        CHECK(inst != 0, "the refused refresh control opens");
+        if (inst == 0) {
+            continue;
+        }
+        serves_bytes(inst, "{\"name\":\"db\"}", (const uint8_t *)"old-material", 12);
+        memset(&refresh_in, 0, sizeof refresh_in);
+        memset(&refreshed, 0, sizeof refreshed);
+        refresh_in.head.size = sizeof refresh_in;
+        refresh_in.settings = blob(cases[k].settings);
+        refreshed.size = sizeof refreshed;
+        outcome = head_ops()->refresh(inst, &refresh_in, &refreshed);
+        CHECK(outcome == BB_MECH_Outcome_Failed && refreshed.outcome == outcome &&
+                  refreshed.error.ptr != 0 && refreshed.error.len == n &&
+                  memcmp(refreshed.error.ptr, cases[k].why, n) == 0,
+              "credential-bearing refresh must fail with its specific static reason");
+        refusal_contains_no_credential(&refreshed, 0, 0);
+        serves_bytes(inst, "{\"name\":\"db\"}", (const uint8_t *)"old-material", 12);
+        CHECK(held_copies(REJECTED_MATERIAL) == 0, "refresh retained a rejected candidate");
+        close_instance(inst);
+    }
+}
+
+/* C1: old hosts may omit append-only input tails. Drive the existing door with actual prefix
+ * records as well as every byte boundary of the pointer/capacity tails. No partial field is live. */
+static bb_secret_ResolveOut resolve_raw(void *inst, const void *in) {
+    bb_secret_ResolveOut out;
+    memset(&out, 0, sizeof out);
+    out.head.size = sizeof out;
+    secret_ops()->resolve(inst, in, &out);
+    return out;
+}
+
+static void input_prefixes_default_only_whole_fields(void) {
+    bb_mech_InHead head;
+    bb_mech_ValidateIn validate_in;
+    bb_mech_OpenIn open_in;
+    bb_mech_RefreshIn refresh_in;
+    bb_mech_ReleaseIn release_in;
+    bb_mech_OutHead out;
+    bb_mech_OpenOut opened;
+    bb_secret_ResolveIn resolve_in;
+    bb_secret_ResolveOut resolved;
+    struct {
+        bb_mech_InHead head;
+        bb_mech_Blob settings;
+    } resolve_prefix;
+    uint8_t why[32], buf[16], untouched[32];
+    size_t cut, end;
+    void *inst;
+
+    memset(&head, 0, sizeof head);
+    head.size = sizeof head;
+    memset(&out, 0, sizeof out);
+    out.size = sizeof out;
+    CHECK(head_ops()->validate(0, &head, &out) == BB_MECH_Outcome_Failed &&
+              out.error.ptr == 0 && out.error.len == 0,
+          "validate: absent settings/reason tail is a normal refusal with no lent reason");
+    memset(&opened, 0, sizeof opened);
+    opened.head.size = sizeof opened;
+    CHECK(head_ops()->open(0, &head, &opened) == BB_MECH_Outcome_Failed &&
+              opened.instance == 0 && opened.err_len == 0 && opened.head.error.len == 0,
+          "open: absent settings/reason tail fails through OpenOut.err_len=0");
+
+    memset(&validate_in, 0, sizeof validate_in);
+    validate_in.settings = blob("{\"values\":{\"db\":\"old\"}}");
+    validate_in.head.size = (uint32_t)(offsetof(bb_mech_ValidateIn, settings) +
+                                      offsetof(bb_mech_Blob, fmt));
+    memset(&out, 0, sizeof out);
+    out.size = sizeof out;
+    CHECK(head_ops()->validate(0, &validate_in, &out) == BB_MECH_Outcome_Ready,
+          "validate: complete settings pointer/length work without fmt/flags/reason tails");
+    memset(&open_in, 0, sizeof open_in);
+    open_in.settings = validate_in.settings;
+    open_in.head.size = (uint32_t)(offsetof(bb_mech_OpenIn, settings) +
+                                  offsetof(bb_mech_Blob, fmt));
+    memset(&opened, 0, sizeof opened);
+    opened.head.size = sizeof opened;
+    CHECK(head_ops()->open(0, &open_in, &opened) == BB_MECH_Outcome_Ready && opened.instance != 0,
+          "open: complete settings pointer/length work without later input tails");
+    if (opened.head.outcome == BB_MECH_Outcome_Ready && opened.instance != 0) {
+        serves_bytes(opened.instance, "{\"name\":\"db\"}", (const uint8_t *)"old", 3);
+        close_instance(opened.instance);
+    }
+
+    memset(untouched, 0xA5, sizeof untouched);
+    validate_in.settings = blob("[]");
+    validate_in.err_buf = why;
+    validate_in.err_cap = 5;
+    end = offsetof(bb_mech_ValidateIn, err_cap) + sizeof validate_in.err_cap;
+    for (cut = offsetof(bb_mech_ValidateIn, err_buf); cut < end; cut++) {
+        validate_in.head.size = (uint32_t)cut;
+        memcpy(why, untouched, sizeof why);
+        memset(&out, 0, sizeof out);
+        out.size = sizeof out;
+        CHECK(head_ops()->validate(0, &validate_in, &out) == BB_MECH_Outcome_Failed &&
+                  out.error.len == 0 && memcmp(why, untouched, sizeof why) == 0 &&
+                  out.error.ptr == (cut >= offsetof(bb_mech_ValidateIn, err_buf) +
+                                   sizeof validate_in.err_buf ? why : 0),
+              "validate: absent/partial reason pointer or cap writes nothing at %llu",
+              (unsigned long long)cut);
+    }
+    validate_in.head.size = sizeof validate_in;
+    memset(&out, 0, sizeof out);
+    out.size = sizeof out;
+    CHECK(head_ops()->validate(0, &validate_in, &out) == BB_MECH_Outcome_Failed &&
+              out.error.ptr == why && out.error.len == 5 && memcmp(why, "settings:", 5) == 0 &&
+              why[5] == 0xA5, "validate: a complete reason tail lends only its capacity");
+
+    open_in.settings = blob("[]");
+    open_in.err_buf = why;
+    open_in.err_cap = 5;
+    end = offsetof(bb_mech_OpenIn, err_cap) + sizeof open_in.err_cap;
+    for (cut = offsetof(bb_mech_OpenIn, err_buf); cut < end; cut++) {
+        open_in.head.size = (uint32_t)cut;
+        memcpy(why, untouched, sizeof why);
+        memset(&opened, 0, sizeof opened);
+        opened.head.size = sizeof opened;
+        CHECK(head_ops()->open(0, &open_in, &opened) == BB_MECH_Outcome_Failed &&
+                  opened.err_len == 0 && opened.head.error.len == 0 &&
+                  memcmp(why, untouched, sizeof why) == 0,
+              "open: incomplete reason tail writes no reason at %llu", (unsigned long long)cut);
+    }
+    open_in.head.size = sizeof open_in;
+    memset(&opened, 0, sizeof opened);
+    opened.head.size = sizeof opened;
+    CHECK(head_ops()->open(0, &open_in, &opened) == BB_MECH_Outcome_Failed &&
+              opened.err_len == 5 && opened.head.error.len == 0 &&
+              memcmp(why, "settings:", 5) == 0 && why[5] == 0xA5,
+          "open: complete reason tail uses the lent bytes and OpenOut.err_len");
+
+    inst = open_instance("{\"values\":{\"db\":\"old\"}}");
+    CHECK(inst != 0, "opens for short refresh and resolve");
+    if (inst == 0) {
+        return;
+    }
+    memset(&out, 0, sizeof out);
+    out.size = sizeof out;
+    CHECK(head_ops()->refresh(inst, &head, &out) == BB_MECH_Outcome_Failed &&
+              out.error.len == strlen(NONE_TEXT) &&
+              memcmp(out.error.ptr, NONE_TEXT, strlen(NONE_TEXT)) == 0,
+          "refresh: omitted settings follow the existing missing-settings refusal");
+    serves_bytes(inst, "{\"name\":\"db\"}", (const uint8_t *)"old", 3);
+    memset(&refresh_in, 0, sizeof refresh_in);
+    refresh_in.settings = blob("{\"values\":{\"db\":\"new\"}}");
+    end = offsetof(bb_mech_RefreshIn, settings) + offsetof(bb_mech_Blob, fmt);
+    for (cut = offsetof(bb_mech_RefreshIn, settings); cut < end; cut++) {
+        refresh_in.head.size = (uint32_t)cut;
+        memset(&out, 0, sizeof out);
+        out.size = sizeof out;
+        CHECK(head_ops()->refresh(inst, &refresh_in, &out) == BB_MECH_Outcome_Failed &&
+                  out.error.len == strlen(NONE_TEXT) &&
+                  memcmp(out.error.ptr, NONE_TEXT, strlen(NONE_TEXT)) == 0,
+              "refresh: incomplete settings pointer/length is absent at %llu",
+              (unsigned long long)cut);
+    }
+    refresh_in.head.size = (uint32_t)(offsetof(bb_mech_RefreshIn, settings) +
+                                     offsetof(bb_mech_Blob, fmt));
+    memset(&out, 0, sizeof out);
+    out.size = sizeof out;
+    CHECK(head_ops()->refresh(inst, &refresh_in, &out) == BB_MECH_Outcome_Ready,
+          "refresh: settings pointer/length are sufficient without the secrets tail");
+    serves_bytes(inst, "{\"name\":\"db\"}", (const uint8_t *)"new", 3);
+
+    memset(&out, 0, sizeof out);
+    out.size = sizeof out;
+    CHECK(head_ops()->release(inst, &head, &out) == BB_MECH_Outcome_Refused &&
+              out.error.len >= strlen("release: no such lease") &&
+              memcmp(out.error.ptr, "release: no such lease", strlen("release: no such lease")) == 0,
+          "release: an absent lease defaults to zero and follows the normal refusal");
+    memset(&release_in, 0, sizeof release_in);
+    release_in.head.size = (uint32_t)(offsetof(bb_mech_ReleaseIn, lease) + sizeof release_in.lease - 1);
+    release_in.lease = UINT64_C(0x1122334455667788);
+    memset(&out, 0, sizeof out);
+    out.size = sizeof out;
+    CHECK(head_ops()->release(inst, &release_in, &out) == BB_MECH_Outcome_Refused &&
+              out.error.len >= strlen("release: no such lease") &&
+              memcmp(out.error.ptr, "release: no such lease", strlen("release: no such lease")) == 0,
+          "release: a partial lease field is absent, not a short-frame refusal");
+
+    resolved = resolve_raw(inst, &head);
+    CHECK(resolved.head.outcome == BB_MECH_Outcome_Failed &&
+              resolved.error_kind == BB_SECRET_ERROR_KIND_INVALID && resolved.needed == 0 &&
+              resolved.secret.ptr == 0 && resolved.secret.len == 0,
+          "resolve: absent reference settings use the existing INVALID answer");
+    memset(&resolve_prefix, 0, sizeof resolve_prefix);
+    resolve_prefix.head.size = sizeof resolve_prefix;
+    resolve_prefix.settings = blob("{\"name\":\"db\"}");
+    resolved = resolve_raw(inst, &resolve_prefix);
+    CHECK(resolved.head.outcome == BB_MECH_Outcome_Failed &&
+              resolved.error_kind == BB_SECRET_ERROR_KIND_UNSET && resolved.needed == 3 &&
+              resolved.secret.ptr == 0 && resolved.secret.len == 0 && resolved.head.lease == 0,
+          "resolve: an actual settings-only input reports the full needed size with no output");
+    memset(&resolve_in, 0, sizeof resolve_in);
+    resolve_in.settings = resolve_prefix.settings;
+    resolve_in.secret_buf = buf;
+    resolve_in.secret_cap = sizeof buf;
+    end = offsetof(bb_secret_ResolveIn, secret_cap) + sizeof resolve_in.secret_cap;
+    for (cut = offsetof(bb_secret_ResolveIn, secret_buf); cut < end; cut++) {
+        resolve_in.head.size = (uint32_t)cut;
+        memset(buf, 0xA5, sizeof buf);
+        resolved = resolve_raw(inst, &resolve_in);
+        CHECK(resolved.head.outcome == BB_MECH_Outcome_Failed &&
+                  resolved.error_kind == BB_SECRET_ERROR_KIND_UNSET && resolved.needed == 3 &&
+                  resolved.secret.ptr == 0 && resolved.secret.len == 0 &&
+                  memcmp(buf, untouched, sizeof buf) == 0,
+              "resolve: incomplete output pointer/cap writes nothing at %llu",
+              (unsigned long long)cut);
+    }
+    resolve_in.head.size = sizeof resolve_in;
+    resolve_in.secret_cap = 2;
+    resolved = resolve_raw(inst, &resolve_in);
+    CHECK(resolved.head.outcome == BB_MECH_Outcome_Failed && resolved.needed == 3 &&
+              resolved.error_kind == BB_SECRET_ERROR_KIND_UNSET &&
+              memcmp(buf, untouched, sizeof buf) == 0, "resolve: real short buffer still writes nothing");
+    resolve_in.secret_cap = 3;
+    resolved = resolve_raw(inst, &resolve_in);
+    CHECK(resolved.head.outcome == BB_MECH_Outcome_Ready && resolved.secret.ptr == buf &&
+              resolved.secret.len == 3 && resolved.needed == 0 &&
+              memcmp(buf, "new", 3) == 0 && buf[3] == 0xA5,
+          "resolve: complete pointer/cap writes exactly the material");
+    memset(buf, 0, sizeof buf);
+    close_instance(inst);
+}
+
 int main(void) {
     a_resolve_leaves_no_copy_behind();
     a_value_over_the_buffer_is_the_short_answer();
@@ -1012,6 +1347,8 @@ int main(void) {
     depth_and_malformed_reference_diagnostics_name_the_cause();
     every_escape_class_decodes_into_the_host_buffer();
     a_second_open_keeps_the_first_instance_and_check_stays_unserved();
+    input_prefixes_default_only_whole_fields();
+    refused_candidates_are_not_echoed_or_kept();
     if (failures) {
         fprintf(stderr, "%d failure(s)\n", failures);
         return 1;
