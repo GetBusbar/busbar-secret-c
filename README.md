@@ -43,9 +43,15 @@ module). A reference of no bytes is `{}`, so it is missing `name`. A static text
 stray key, so the extra-key refusal does not. An empty material is refused (`the material is EMPTY;
 a secret must be non-empty (fail-closed)`). A resolved material is decoded straight into the host's buffer
 (flagged secret) under no lease, and the plugin keeps no copy of it; a material over that buffer
-gets the short-buffer answer. At most one instance, whose ops hold one lock (a `refresh` never
-races a `resolve`); at most 8 KiB of settings (as written), 1 KiB of material per name and 1 KiB
-per name (both decoded), and JSON nested at most 32 deep. `\u` escapes decode to UTF-8, a
+gets FAILED with `needed` equal to its decoded length, error kind UNSET, no lease and no bytes
+written; the host retries with that capacity. `release` always answers REFUSED because no lease
+is granted. `check` also answers REFUSED: the plugin leaves config-time reference checking
+unserved, and `resolve` judges each reference. These are outcomes, not promised error strings.
+Each op requires its complete output record; a NULL or shorter output is FAULT, written nothing.
+
+At most one instance, whose ops hold one lock (a `refresh` never races a `resolve`); at most
+8 KiB of settings (as written), 1 KiB of material per value and 1 KiB for each name (both decoded),
+and JSON nested at most 32 deep. `\u` escapes decode to UTF-8, a
 surrogate pair to its 4 bytes; an unpaired surrogate is refused.
 
 ## Build
@@ -53,10 +59,16 @@ surrogate pair to its 4 bytes; an unpaired surrogate is refused.
 Against `busbar_plugin.h` from busbar at the commit in `.busbar-ref`
 (`crates/busbar-contract/include/`):
 
+The supported builds are Linux with GCC or Clang and macOS with Clang, using C11 atomics and
+the generated header's 64-bit layouts. Windows toolchains are not currently qualified.
+
 ```bash
+mkdir -p target
 cc -std=c11 -Wall -Wextra -Werror -pedantic -fPIC -shared \
-  -I <busbar>/crates/busbar-contract/include -o libbusbar_secret_c.so secret-c/*.c
+  -I <busbar>/crates/busbar-contract/include -o target/libbusbar_secret_c.so secret-c/*.c
 ```
+
+On macOS use `-dynamiclib` and `target/libbusbar_secret_c.dylib`.
 
 `.version` in the Statement is a literal (`"1.6.0"`, there is no Cargo here): bump it by hand at
 release.
@@ -69,14 +81,16 @@ over `secret-c/conformance.json`, with its RED arm (the sources rebuilt at anoth
 refused). Locally, from a busbar checkout at the pin:
 
 ```bash
-BUSBAR_DROPPED_LIB=$PWD/libbusbar_secret_c.so BUSBAR_DROPPED_SOURCES=$PWD/secret-c \
+BUSBAR_DROPPED_LIB=$PWD/target/libbusbar_secret_c.so BUSBAR_DROPPED_SOURCES=$PWD/secret-c \
 BUSBAR_DROPPED_SCRIPT=$PWD/secret-c/conformance.json \
   cargo run --manifest-path <busbar>/Cargo.toml --locked -p busbar-test-kit \
   --example dropped_conformance
 ```
 
 The unit tests (`secret-c/tests/unit.c`, not part of the plugin) drive the door directly for
-what the conformance script does not judge, under ThreadSanitizer:
+what the conformance script does not judge, including input field boundaries, refresh custody
+and credential-bearing refusals. The current normal CI `cunit` check runs them under
+ThreadSanitizer. To run them locally:
 
 ```bash
 cc -std=c11 -Wall -Wextra -Werror -pedantic -fsanitize=thread -g -DBUSBAR_SECRET_C_UNIT \

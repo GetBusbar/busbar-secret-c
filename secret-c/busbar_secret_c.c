@@ -36,9 +36,10 @@
  *
  * WHAT IT HOLDS: the material lives in the instance's kept settings, zeroed (volatile writes) when
  * a `refresh` replaces them and when it is closed. A resolve decodes into the host's buffer
- * byte by byte; the few bytes of decoding scratch on its stack are zeroed before it returns.
- * The rest of the lifecycle (retire, tick, drive, cancel) answers READY. An `out` shorter than its
- * head is a FAULT at every op, written nothing.
+ * byte by byte; its selected byte/codepoint decoding scratch is held in volatile memory and
+ * zeroed before it returns. This does not promise erasure of compiler temporaries or registers.
+ * The rest of the lifecycle (retire, tick, drive, cancel) answers READY. Each op requires its
+ * complete `out` record; a NULL or shorter `out` is a FAULT, written nothing.
  *
  * BUSBAR_PLUGIN_KIND_ABI (default BB_SECRET_ABI_VERSION) is the kind ABI the door and its
  * Statement state. busbar's C conformance builds this source again with another value: the
@@ -166,6 +167,32 @@ static size_t lend(uint8_t *buf, size_t cap, const char *text) {
     return n;
 }
 
+/* Absent tail fields are zero, including a field only partly covered by in.size. Copy a whole
+ * scalar's representation only after checking its complete boundary; never synthesize a partial
+ * pointer or integer. The caller initializes `to` to its typed zero before asking for a field. */
+static void input_field(void *to, size_t width, const void *in, size_t size, size_t offset) {
+    size_t k;
+    uint8_t *dst = to;
+    const uint8_t *src = in;
+    if (offset > size || width > size - offset) {
+        return;
+    }
+    for (k = 0; k < width; k++) {
+        dst[k] = src[offset + k];
+    }
+}
+
+/* A blob's complete pointer/length can precede an omitted fmt/flags tail. Read each field at its
+ * own boundary, rather than treating a partly present nested record as a bytewise struct copy. */
+static bb_mech_Blob input_blob(const void *in, size_t size, size_t offset) {
+    bb_mech_Blob b = { 0 };
+    input_field(&b.ptr, sizeof b.ptr, in, size, offset + offsetof(bb_mech_Blob, ptr));
+    input_field(&b.len, sizeof b.len, in, size, offset + offsetof(bb_mech_Blob, len));
+    input_field(&b.fmt, sizeof b.fmt, in, size, offset + offsetof(bb_mech_Blob, fmt));
+    input_field(&b.flags, sizeof b.flags, in, size, offset + offsetof(bb_mech_Blob, flags));
+    return b;
+}
+
 /* ---- a JSON scanner: just enough to read the two settings shapes, and to refuse the rest ---- */
 
 struct cursor {
@@ -179,101 +206,109 @@ static void ws(struct cursor *c) {
     }
 }
 
-static int hex(uint8_t h) {
-    if (h >= '0' && h <= '9') return h - '0';
-    if (h >= 'a' && h <= 'f') return h - 'a' + 10;
-    if (h >= 'A' && h <= 'F') return h - 'A' + 10;
-    return -1;
+/* Convert the scratch-held hex byte in place, without a separate material-bearing scalar local. */
+static int hex_in(volatile int *h) {
+    if (*h >= '0' && *h <= '9') { *h -= '0'; return 1; }
+    if (*h >= 'a' && *h <= 'f') { *h = *h - 'a' + 10; return 1; }
+    if (*h >= 'A' && *h <= 'F') { *h = *h - 'A' + 10; return 1; }
+    return 0;
 }
 
-/* [`string`]'s body, decoding through the caller's 4-byte scratch `enc`. */
-static int string_in(struct cursor *c, uint8_t *out, size_t cap, size_t *len, uint8_t *enc) {
+struct string_scratch {
+    uint8_t b;
+    uint32_t cp, lo;
+    int h;
+    uint8_t enc[4];
+};
+
+/* [`string`]'s body; every selected material-bearing scalar lives in its caller's scratch. */
+static int string_in(struct cursor *c, uint8_t *out, size_t cap, size_t *len,
+                     volatile struct string_scratch *s) {
     size_t n = 0;
     if (c->p >= c->end || *c->p != '"') {
         return 0;
     }
     c->p++;
     while (c->p < c->end) {
-        uint8_t b = *c->p++;
-        uint32_t cp;
         size_t k, m;
-        if (b == '"') {
+        s->b = *c->p++;
+        if (s->b == '"') {
             *len = n;
             return 1;
         }
-        if (b < 0x20) {
+        if (s->b < 0x20) {
             return 0;
         }
-        if (b != '\\') {
-            enc[0] = b;
+        if (s->b != '\\') {
+            s->enc[0] = s->b;
             m = 1;
         } else {
             if (c->p >= c->end) {
                 return 0;
             }
-            b = *c->p++;
+            s->b = *c->p++;
             m = 1;
-            switch (b) {
-            case '"': enc[0] = '"'; break;
-            case '\\': enc[0] = '\\'; break;
-            case '/': enc[0] = '/'; break;
-            case 'b': enc[0] = '\b'; break;
-            case 'f': enc[0] = '\f'; break;
-            case 'n': enc[0] = '\n'; break;
-            case 'r': enc[0] = '\r'; break;
-            case 't': enc[0] = '\t'; break;
+            switch (s->b) {
+            case '"': s->enc[0] = '"'; break;
+            case '\\': s->enc[0] = '\\'; break;
+            case '/': s->enc[0] = '/'; break;
+            case 'b': s->enc[0] = '\b'; break;
+            case 'f': s->enc[0] = '\f'; break;
+            case 'n': s->enc[0] = '\n'; break;
+            case 'r': s->enc[0] = '\r'; break;
+            case 't': s->enc[0] = '\t'; break;
             case 'u':
                 if (c->end - c->p < 4) {
                     return 0;
                 }
-                cp = 0;
+                s->cp = 0;
                 for (k = 0; k < 4; k++) {
-                    int h = hex(c->p[k]);
-                    if (h < 0) {
+                    s->h = c->p[k];
+                    if (!hex_in(&s->h)) {
                         return 0;
                     }
-                    cp = cp * 16 + (uint32_t)h;
+                    s->cp = s->cp * 16 + (uint32_t)s->h;
                 }
                 c->p += 4;
-                if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                if (s->cp >= 0xDC00 && s->cp <= 0xDFFF) {
                     return 0; /* a low surrogate with no high one before it */
                 }
-                if (cp >= 0xD800 && cp <= 0xDBFF) {
+                if (s->cp >= 0xD800 && s->cp <= 0xDBFF) {
                     /* RFC 8259 section 7: a character past the Basic Multilingual Plane is a
                      * high surrogate escape followed by a low one; anything else is unpaired. */
-                    uint32_t lo = 0;
+                    s->lo = 0;
                     if (c->end - c->p < 6 || c->p[0] != '\\' || c->p[1] != 'u') {
                         return 0;
                     }
                     for (k = 0; k < 4; k++) {
-                        int h = hex(c->p[2 + k]);
-                        if (h < 0) {
+                        s->h = c->p[2 + k];
+                        if (!hex_in(&s->h)) {
                             return 0;
                         }
-                        lo = lo * 16 + (uint32_t)h;
+                        s->lo = s->lo * 16 + (uint32_t)s->h;
                     }
-                    if (lo < 0xDC00 || lo > 0xDFFF) {
+                    if (s->lo < 0xDC00 || s->lo > 0xDFFF) {
                         return 0;
                     }
                     c->p += 6;
-                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                    s->cp = 0x10000 + ((s->cp - 0xD800) << 10) + (s->lo - 0xDC00);
                 }
-                if (cp < 0x80) {
-                    enc[0] = (uint8_t)cp;
-                } else if (cp < 0x800) {
-                    enc[0] = (uint8_t)(0xC0 | (cp >> 6));
-                    enc[1] = (uint8_t)(0x80 | (cp & 0x3F));
+                if (s->cp < 0x80) {
+                    s->enc[0] = (uint8_t)s->cp;
+                } else if (s->cp < 0x800) {
+                    s->enc[0] = (uint8_t)(0xC0 | (s->cp >> 6));
+                    s->enc[1] = (uint8_t)(0x80 | (s->cp & 0x3F));
                     m = 2;
-                } else if (cp < 0x10000) {
-                    enc[0] = (uint8_t)(0xE0 | (cp >> 12));
-                    enc[1] = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));
-                    enc[2] = (uint8_t)(0x80 | (cp & 0x3F));
+                } else if (s->cp < 0x10000) {
+                    s->enc[0] = (uint8_t)(0xE0 | (s->cp >> 12));
+                    s->enc[1] = (uint8_t)(0x80 | ((s->cp >> 6) & 0x3F));
+                    s->enc[2] = (uint8_t)(0x80 | (s->cp & 0x3F));
                     m = 3;
                 } else {
-                    enc[0] = (uint8_t)(0xF0 | (cp >> 18));
-                    enc[1] = (uint8_t)(0x80 | ((cp >> 12) & 0x3F));
-                    enc[2] = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));
-                    enc[3] = (uint8_t)(0x80 | (cp & 0x3F));
+                    s->enc[0] = (uint8_t)(0xF0 | (s->cp >> 18));
+                    s->enc[1] = (uint8_t)(0x80 | ((s->cp >> 12) & 0x3F));
+                    s->enc[2] = (uint8_t)(0x80 | ((s->cp >> 6) & 0x3F));
+                    s->enc[3] = (uint8_t)(0x80 | (s->cp & 0x3F));
                     m = 4;
                 }
                 break;
@@ -286,7 +321,7 @@ static int string_in(struct cursor *c, uint8_t *out, size_t cap, size_t *len, ui
                 if (n >= cap) {
                     return 0;
                 }
-                out[n] = enc[k];
+                out[n] = s->enc[k];
             }
             n++;
         }
@@ -297,11 +332,12 @@ static int string_in(struct cursor *c, uint8_t *out, size_t cap, size_t *len, ui
 /* One JSON string at the cursor, decoded into `out` (`cap` bytes; `out` may be 0 to only scan).
  * Answers 1 and the decoded length in `*len`, or 0 when it is not a well-formed string or does not
  * fit. \u escapes decode to UTF-8, a surrogate pair to its 4 bytes; an unpaired surrogate is
- * refused. The decoding scratch (a decoded material's last bytes) is zeroed before it returns. */
+ * refused. Selected byte/codepoint scratch is volatile and zeroed on success and failure. This
+ * concerns that memory only, not compiler-generated copies or registers. */
 static int string(struct cursor *c, uint8_t *out, size_t cap, size_t *len) {
-    uint8_t enc[4] = { 0, 0, 0, 0 };
-    int r = string_in(c, out, cap, len, enc);
-    zero(enc, sizeof enc);
+    volatile struct string_scratch scratch = { 0 };
+    int r = string_in(c, out, cap, len, &scratch);
+    zero((volatile uint8_t *)&scratch, sizeof scratch);
     return r;
 }
 
@@ -509,6 +545,7 @@ static const char NOT_AN_OBJECT[] = "settings: must be a JSON object; nested at 
                                     TEXT(DEPTH_CAP) " deep, with no unpaired \\u surrogate";
 static const char NO_SETTINGS[] = "settings: c requires settings (values); none provided";
 static const char NO_VALUES[] = "settings: `values` must be an object";
+static const char REQUIRED_VALUES[] = "settings: `values` is required";
 static const char ONLY_VALUES[] = "settings: `values` is the only setting";
 static const char VALUES_TWICE[] = "settings: `values` is given more than once";
 static const char EMPTY_NAME[] = "settings: a `values` name is empty";
@@ -523,7 +560,11 @@ static const char NO_LEASE[] =
     "release: no such lease (a resolved value is written into the host's buffer, never leased)";
 static const char MISSING_NAME[] = "missing or non-string `name` in secret reference settings";
 static const char NO_SUCH_NAME[] = "c holds no secret by that name";
-static const char TOO_LARGE[] = "settings: larger than this plugin keeps";
+static const char TOO_LARGE[] = "settings: larger than " TEXT(SETTINGS_CAP)
+                                " bytes, the most this plugin keeps";
+static const char BAD_REFERENCE_OBJECT[] =
+    "secret reference settings must be well-formed JSON, nested at most " TEXT(DEPTH_CAP)
+    " deep, with no unpaired \\u surrogate";
 
 /* Whether a name before `upto` in the `values` object whose first entry starts at `from` decodes
  * to `name` (`len` bytes). Every name before `upto` was judged already, so each decodes whole. */
@@ -572,13 +613,12 @@ static const char *values_refusal(struct cursor *c) {
     for (;;) {
         uint8_t name[MATERIAL_CAP];
         const uint8_t *at;
-        struct cursor probe;
         size_t n;
         ws(c);
         at = c->p;
-        probe = *c;
         if (!string(c, name, sizeof name, &n)) {
-            return string(&probe, 0, 0, &n) ? NAME_TOO_LARGE : NOT_STRINGS;
+            /* one_object already validated the key; only the name capacity can fail here. */
+            return NAME_TOO_LARGE;
         }
         if (n == 0) {
             return EMPTY_NAME;
@@ -628,7 +668,7 @@ static const char *settings_refusal(const uint8_t *ptr, size_t len) {
     c.p++;
     ws(&c);
     if (c.p < c.end && *c.p == '}') {
-        return NO_VALUES;
+        return REQUIRED_VALUES;
     }
     for (;;) {
         const char *why;
@@ -695,24 +735,30 @@ static int only_member(const uint8_t *ptr, size_t len, const char *want) {
 /* ---- the lifecycle ---- */
 
 static bb_mech_RawOutcome op_validate(void *inst, const void *in, void *out) {
-    const bb_mech_ValidateIn *v = in;
+    const bb_mech_InHead *head = in;
     bb_mech_OutHead *o = out;
+    bb_mech_Blob settings;
+    uint8_t *err_buf = 0;
+    size_t err_cap = 0;
     const char *why;
     size_t n;
     (void)inst;
     if (o == 0 || o->size < sizeof *o) {
         return (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
     }
-    if (v->head.size < sizeof *v) {
-        return say(o, sizeof *o, BB_MECH_Outcome_Refused, "validate: short in");
+    if (head == 0) {
+        return answer(o, sizeof *o, BB_MECH_Outcome_Fault);
     }
-    why = settings_refusal(v->settings.ptr, v->settings.len);
+    settings = input_blob(in, head->size, offsetof(bb_mech_ValidateIn, settings));
+    input_field(&err_buf, sizeof err_buf, in, head->size, offsetof(bb_mech_ValidateIn, err_buf));
+    input_field(&err_cap, sizeof err_cap, in, head->size, offsetof(bb_mech_ValidateIn, err_cap));
+    why = settings_refusal(settings.ptr, settings.len);
     if (why == 0) {
         return answer(o, sizeof *o, BB_MECH_Outcome_Ready);
     }
     /* No instance holds the reason past the call: it goes into the host's lent buffer. */
-    n = lend(v->err_buf, v->err_cap, why);
-    o->error.ptr = v->err_buf;
+    n = lend(err_buf, err_cap, why);
+    o->error.ptr = err_buf;
     o->error.len = n;
     return answer(o, sizeof *o, BB_MECH_Outcome_Failed);
 }
@@ -733,23 +779,29 @@ static const char *keep(struct instance *s, const bb_mech_Blob *settings) {
 }
 
 static bb_mech_RawOutcome op_open_held(void *inst, const void *in, void *out) {
-    const bb_mech_OpenIn *i = in;
+    const bb_mech_InHead *head = in;
     bb_mech_OpenOut *o = out;
+    bb_mech_Blob settings;
+    uint8_t *err_buf = 0;
+    size_t err_cap = 0;
     const char *why;
     (void)inst;
     if (o == 0 || o->head.size < sizeof *o) {
         return (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
     }
-    if (i->head.size < sizeof *i) {
-        return say(&o->head, sizeof *o, BB_MECH_Outcome_Refused, "open: short frame");
+    if (head == 0) {
+        return answer(&o->head, sizeof *o, BB_MECH_Outcome_Fault);
     }
+    settings = input_blob(in, head->size, offsetof(bb_mech_OpenIn, settings));
+    input_field(&err_buf, sizeof err_buf, in, head->size, offsetof(bb_mech_OpenIn, err_buf));
+    input_field(&err_cap, sizeof err_cap, in, head->size, offsetof(bb_mech_OpenIn, err_cap));
     if (THE_INSTANCE.open) {
-        o->err_len = lend(i->err_buf, i->err_cap, "one instance only");
+        o->err_len = lend(err_buf, err_cap, "one instance only");
         return answer(&o->head, sizeof *o, BB_MECH_Outcome_Failed);
     }
-    why = keep(&THE_INSTANCE, &i->settings);
+    why = keep(&THE_INSTANCE, &settings);
     if (why != 0) {
-        o->err_len = lend(i->err_buf, i->err_cap, why);
+        o->err_len = lend(err_buf, err_cap, why);
         return answer(&o->head, sizeof *o, BB_MECH_Outcome_Failed);
     }
     THE_INSTANCE.open = 1;
@@ -759,16 +811,18 @@ static bb_mech_RawOutcome op_open_held(void *inst, const void *in, void *out) {
 
 static bb_mech_RawOutcome op_refresh_held(void *inst, const void *in, void *out) {
     struct instance *s = inst;
-    const bb_mech_RefreshIn *r = in;
+    const bb_mech_InHead *head = in;
     bb_mech_OutHead *o = out;
+    bb_mech_Blob settings;
     const char *why;
     if (o == 0 || o->size < sizeof *o) {
         return (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
     }
-    if (r->head.size < sizeof *r) {
-        return say(o, sizeof *o, BB_MECH_Outcome_Refused, "refresh: short in");
+    if (head == 0) {
+        return answer(o, sizeof *o, BB_MECH_Outcome_Fault);
     }
-    why = keep(s, &r->settings);
+    settings = input_blob(in, head->size, offsetof(bb_mech_RefreshIn, settings));
+    why = keep(s, &settings);
     if (why != 0) {
         return say(o, sizeof *o, BB_MECH_Outcome_Failed, why);
     }
@@ -809,15 +863,15 @@ static bb_mech_RawOutcome op_cancel(void *inst, const void *in, void *out) {
 
 /* No lease is ever granted (a resolved value is the host's), so every release is refused. */
 static bb_mech_RawOutcome op_release(void *inst, const void *in, void *out) {
-    const bb_mech_ReleaseIn *r = in;
     bb_mech_OutHead *o = out;
     (void)inst;
     if (o == 0 || o->size < sizeof *o) {
         return (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
     }
-    if (r->head.size < sizeof *r) {
-        return say(o, sizeof *o, BB_MECH_Outcome_Refused, "release: short in");
+    if (in == 0) {
+        return answer(o, sizeof *o, BB_MECH_Outcome_Fault);
     }
+    /* No lease, zero or otherwise, is served. Nothing in the input tail needs reading. */
     return say(o, sizeof *o, BB_MECH_Outcome_Refused, NO_LEASE);
 }
 
@@ -846,8 +900,11 @@ static bb_mech_RawOutcome resolve_failed(bb_secret_ResolveOut *o, uint32_t kind,
 
 static bb_mech_RawOutcome op_resolve_held(void *inst, const void *in, void *out) {
     struct instance *s = inst;
-    const bb_secret_ResolveIn *i = in;
+    const bb_mech_InHead *head = in;
     bb_secret_ResolveOut *o = out;
+    bb_mech_Blob settings;
+    uint8_t *secret_buf = 0;
+    size_t secret_cap = 0;
     uint8_t name[MATERIAL_CAP];
     size_t name_len = 0, len = 0;
     int members;
@@ -855,25 +912,38 @@ static bb_mech_RawOutcome op_resolve_held(void *inst, const void *in, void *out)
     if (o == 0 || o->head.size < sizeof *o) {
         return (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
     }
-    if (i->head.size < sizeof *i) {
-        return say(&o->head, sizeof *o, BB_MECH_Outcome_Refused, "resolve: short frame");
+    if (head == 0) {
+        return answer(&o->head, sizeof *o, BB_MECH_Outcome_Fault);
     }
+    settings = input_blob(in, head->size, offsetof(bb_secret_ResolveIn, settings));
+    input_field(&secret_buf, sizeof secret_buf, in, head->size,
+                offsetof(bb_secret_ResolveIn, secret_buf));
+    input_field(&secret_cap, sizeof secret_cap, in, head->size,
+                offsetof(bb_secret_ResolveIn, secret_cap));
     /* The name asked for: {"name": "<string>"}. No bytes at all is `{}` (the SDK's settings_of). */
-    if (i->settings.len == 0) {
+    if (settings.len == 0) {
         return resolve_failed(o, BB_SECRET_ERROR_KIND_INVALID, MISSING_NAME);
     }
-    if (!one_object(i->settings.ptr, i->settings.len)) {
+    if (!one_object(settings.ptr, settings.len)) {
+        if (settings.ptr != 0) {
+            c.p = settings.ptr;
+            c.end = settings.ptr + settings.len;
+            ws(&c);
+            if (c.p < c.end && *c.p == '{') {
+                return resolve_failed(o, BB_SECRET_ERROR_KIND_INVALID, BAD_REFERENCE_OBJECT);
+            }
+        }
         return resolve_failed(o, BB_SECRET_ERROR_KIND_INVALID,
                               "secret settings are not a JSON object");
     }
-    c.p = i->settings.ptr;
-    c.end = i->settings.ptr + i->settings.len;
+    c.p = settings.ptr;
+    c.end = settings.ptr + settings.len;
     ws(&c);
     c.p++;
     if (!member(&c, "name", 0, 0)) {
         return resolve_failed(o, BB_SECRET_ERROR_KIND_INVALID, MISSING_NAME);
     }
-    members = only_member(i->settings.ptr, i->settings.len, "name");
+    members = only_member(settings.ptr, settings.len, "name");
     if (members < 0) {
         return resolve_failed(o, BB_SECRET_ERROR_KIND_INVALID,
                               "c secret reference names only settings.name (fail-closed)");
@@ -918,7 +988,7 @@ static bb_mech_RawOutcome op_resolve_held(void *inst, const void *in, void *out)
         return resolve_failed(o, BB_SECRET_ERROR_KIND_INVALID,
                               "the material is EMPTY; a secret must be non-empty (fail-closed)");
     }
-    if (i->secret_buf == 0 || len > i->secret_cap) {
+    if (secret_buf == 0 || len > secret_cap) {
         /* THE SHORT-BUFFER ANSWER: nothing written, `needed` the full length, no error kind. */
         o->secret.ptr = 0;
         o->secret.len = 0;
@@ -926,8 +996,8 @@ static bb_mech_RawOutcome op_resolve_held(void *inst, const void *in, void *out)
         o->needed = len;
         return answer(&o->head, sizeof *o, BB_MECH_Outcome_Failed);
     }
-    if (!string(&c, i->secret_buf, i->secret_cap, &len)) {
-        zero(i->secret_buf, i->secret_cap);
+    if (!string(&c, secret_buf, secret_cap, &len)) {
+        zero(secret_buf, secret_cap);
         return resolve_failed(o, BB_SECRET_ERROR_KIND_INTERNAL,
                               "resolve: the material did not decode into the host's buffer");
     }
@@ -935,7 +1005,7 @@ static bb_mech_RawOutcome op_resolve_held(void *inst, const void *in, void *out)
     o->needed = 0;
     o->secret.fmt = BB_MECH_BLOB_OCTETS;
     o->secret.flags = BB_MECH_BLOB_SECRET;
-    o->secret.ptr = i->secret_buf;
+    o->secret.ptr = secret_buf;
     o->secret.len = len;
     o->head.lease = 0;
     return answer(&o->head, sizeof *o, BB_MECH_Outcome_Ready);
