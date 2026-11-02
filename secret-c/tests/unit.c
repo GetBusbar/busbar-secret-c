@@ -1561,6 +1561,69 @@ static void nesting_is_capped(void) {
 }
 
 static void check_and_short_in_frames(void) {
+    bb_mech_ValidateIn vin;
+    bb_mech_OpenIn oin;
+    bb_mech_OpenOut oout;
+    bb_mech_RefreshIn rin;
+    bb_mech_ReleaseIn lin;
+    bb_secret_ResolveIn sin;
+    bb_secret_ResolveOut sout;
+    bb_mech_OutHead out;
+    uint8_t buf[32];
+    size_t k;
+    void *inst = open_instance("{\"values\":{\"db\":\"one\"}}");
+    CHECK(inst != 0, "opens before malformed shared-header controls");
+    if (inst == 0) {
+        return;
+    }
+    memset(&vin, 0, sizeof vin);
+    vin.head.size = sizeof(uint32_t);
+    vin.settings = blob("{\"values\":{\"db\":\"two\"}}");
+    memset(&out, 0, sizeof out);
+    out.size = sizeof out;
+    CHECK(head_ops()->validate(0, &vin, &out) == BB_MECH_Outcome_Fault &&
+              out.outcome == BB_MECH_Outcome_Fault && out.error.ptr == 0 && out.error.len == 0,
+          "validate: an incomplete shared header faults without reading the settings tail");
+    memset(&oin, 0, sizeof oin);
+    oin.head.size = sizeof(uint32_t);
+    oin.settings = vin.settings;
+    memset(&oout, 0, sizeof oout);
+    oout.head.size = sizeof oout;
+    CHECK(head_ops()->open(0, &oin, &oout) == BB_MECH_Outcome_Fault &&
+              oout.head.outcome == BB_MECH_Outcome_Fault && oout.instance == 0 && oout.err_len == 0,
+          "open: an incomplete shared header faults before the instance guard");
+    memset(&rin, 0, sizeof rin);
+    rin.head.size = sizeof(uint32_t);
+    rin.settings = vin.settings;
+    memset(&out, 0, sizeof out);
+    out.size = sizeof out;
+    CHECK(head_ops()->refresh(inst, &rin, &out) == BB_MECH_Outcome_Fault &&
+              out.outcome == BB_MECH_Outcome_Fault,
+          "refresh: an incomplete shared header faults without replacing material");
+    serves_bytes(inst, "{\"name\":\"db\"}", (const uint8_t *)"one", 3);
+    memset(&lin, 0, sizeof lin);
+    lin.head.size = sizeof(uint32_t);
+    lin.lease = 42;
+    memset(&out, 0, sizeof out);
+    out.size = sizeof out;
+    CHECK(head_ops()->release(inst, &lin, &out) == BB_MECH_Outcome_Fault &&
+              out.outcome == BB_MECH_Outcome_Fault,
+          "release: an incomplete shared header faults before inspecting a lease");
+    memset(&sin, 0, sizeof sin);
+    sin.head.size = sizeof(uint32_t);
+    sin.settings = blob("{\"name\":\"db\"}");
+    memset(buf, 0xA5, sizeof buf);
+    sin.secret_buf = buf;
+    sin.secret_cap = sizeof buf;
+    memset(&sout, 0, sizeof sout);
+    sout.head.size = sizeof sout;
+    CHECK(secret_ops()->resolve(inst, &sin, &sout) == BB_MECH_Outcome_Fault &&
+              sout.head.outcome == BB_MECH_Outcome_Fault && sout.secret.ptr == 0,
+          "resolve: an incomplete shared header faults without returning material");
+    for (k = 0; k < sizeof buf; k++) {
+        CHECK(buf[k] == 0xA5, "resolve: malformed shared-header control left byte %zu untouched", k);
+    }
+    close_instance(inst);
     a_second_open_keeps_the_first_instance_and_check_stays_unserved();
     input_prefixes_default_only_whole_fields();
 }

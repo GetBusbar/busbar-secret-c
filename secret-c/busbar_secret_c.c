@@ -746,7 +746,7 @@ static bb_mech_RawOutcome op_validate(void *inst, const void *in, void *out) {
     if (o == 0 || o->size < sizeof *o) {
         return (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
     }
-    if (head == 0) {
+    if (head == 0 || head->size < sizeof *head) {
         return answer(o, sizeof *o, BB_MECH_Outcome_Fault);
     }
     settings = input_blob(in, head->size, offsetof(bb_mech_ValidateIn, settings));
@@ -789,7 +789,7 @@ static bb_mech_RawOutcome op_open_held(void *inst, const void *in, void *out) {
     if (o == 0 || o->head.size < sizeof *o) {
         return (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
     }
-    if (head == 0) {
+    if (head == 0 || head->size < sizeof *head) {
         return answer(&o->head, sizeof *o, BB_MECH_Outcome_Fault);
     }
     settings = input_blob(in, head->size, offsetof(bb_mech_OpenIn, settings));
@@ -818,7 +818,7 @@ static bb_mech_RawOutcome op_refresh_held(void *inst, const void *in, void *out)
     if (o == 0 || o->size < sizeof *o) {
         return (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
     }
-    if (head == 0) {
+    if (head == 0 || head->size < sizeof *head) {
         return answer(o, sizeof *o, BB_MECH_Outcome_Fault);
     }
     settings = input_blob(in, head->size, offsetof(bb_mech_RefreshIn, settings));
@@ -868,7 +868,7 @@ static bb_mech_RawOutcome op_release(void *inst, const void *in, void *out) {
     if (o == 0 || o->size < sizeof *o) {
         return (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
     }
-    if (in == 0) {
+    if (in == 0 || ((const bb_mech_InHead *)in)->size < sizeof(bb_mech_InHead)) {
         return answer(o, sizeof *o, BB_MECH_Outcome_Fault);
     }
 
@@ -912,7 +912,7 @@ static bb_mech_RawOutcome op_resolve_held(void *inst, const void *in, void *out)
     if (o == 0 || o->head.size < sizeof *o) {
         return (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
     }
-    if (head == 0) {
+    if (head == 0 || head->size < sizeof *head) {
         return answer(&o->head, sizeof *o, BB_MECH_Outcome_Fault);
     }
     settings = input_blob(in, head->size, offsetof(bb_secret_ResolveIn, settings));
