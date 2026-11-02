@@ -1,54 +1,54 @@
 /*
  * SPDX-License-Identifier: Apache-2.0
  * Copyright (C) 2026 Busbar Inc and contributors
- *
- * busbar-secret-c: a busbar SECRET plugin written in C from the generated header ALONE. It
- * includes busbar_plugin.h and nothing else: no Rust, no busbar crate, no libc header, no
- * allocator. busbar's plugin-ci.yml compiles it with the system C compiler against the header at
- * this repo's busbar pin and loads the library through the loader's dropped-in path
- * (`load_dropped`), then drives the secret kind's conformance script over it.
- *
- * What it serves: named secrets whose material is written in its own settings.
- *
- *   settings          {"values": {"<name>": "<material>", ...}}
- *   resolve settings  {"name": "<name>"}
- *
- * Per op of the secret table:
- *   validate / open / refresh  the settings must be one JSON object whose one setting is `values`,
- *                              an object of non-empty strings of at most MATERIAL_CAP bytes each,
- *                              under distinct non-empty names of at most MATERIAL_CAP bytes (so
- *                              every name it keeps can be asked for), given once; anything else
- *                              FAILS naming why, the same at all three. `open` keeps
- *                              a copy of the settings (at most SETTINGS_CAP bytes); `refresh`
- *                              replaces it.
- *   resolve   READY with the material decoded straight into the HOST'S buffer (`secret_buf`,
- *             octets, flagged secret) under no lease: the plugin keeps no copy of what it
- *             answers (the credential chip, row 6: host-owned secret bytes). A material over the
- *             host's buffer is the short-buffer answer (FAILED, `needed` its length, nothing
- *             written); the host re-calls with a buffer that size. A name it does not hold FAILS
- *             with NOT_FOUND; a resolve settings blob that is not {"name": "<non-empty string>"}
- *             (another setting, or `name` twice, included) FAILS with INVALID; an empty material
- *             FAILS with INVALID.
- *   release   REFUSED: no lease is ever granted.
- *   check     REFUSED ("not served"): resolve judges every reference.
- *   close     the kept settings (the only copy of the material it serves) are zeroed; the
- *             instance is gone.
- *
- * WHAT IT HOLDS: the material lives in the instance's kept settings, zeroed (volatile writes) when
- * a `refresh` replaces them and when it is closed. A resolve decodes into the host's buffer
- * byte by byte; its selected byte/codepoint decoding scratch is held in volatile memory and
- * zeroed before it returns. This does not promise erasure of compiler temporaries or registers.
- * The rest of the lifecycle (retire, tick, drive, cancel) answers READY. Each op requires its
- * complete `out` record; a NULL or shorter `out` is a FAULT, written nothing.
- *
- * BUSBAR_PLUGIN_KIND_ABI (default BB_SECRET_ABI_VERSION) is the kind ABI the door and its
- * Statement state. busbar's C conformance builds this source again with another value: the
- * loader must refuse that build.
- *
- * At most one instance (MARK_ONE_INSTANCE): its state is static, and every op that reads or writes
- * it (open, refresh, resolve, close) holds the instance lock, so a `refresh` the host runs
- * beside a `resolve` never lets it read half-replaced settings. The lock is a ticket lock on C11
- * `_Atomic` counters (a language feature: no header, no libc).
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
  */
 #include "busbar_plugin.h"
 
@@ -70,15 +70,15 @@
 #define TEXT_(x) #x
 #define TEXT(x) TEXT_(x)
 
-/* The largest settings blob `open` keeps, and the largest material (and name) it serves. */
+
 #define SETTINGS_CAP 8192
 #define MATERIAL_CAP 1024
-/* The deepest JSON nesting the scanner follows. */
+
 #define DEPTH_CAP 32
 
-/* ---- the Statement ---- */
 
-/* The plugin states its own config word (every sibling does): `secret-c`, the manifest alias. */
+
+
 static const bb_mech_Rewrite REWRITES[] = {
     { .class_ = BB_MECH_REWRITE_ALIAS, .from = STR("secret-c"), .to = STR("") },
 };
@@ -95,7 +95,7 @@ static const bb_mech_Statement STATEMENT = {
     .rewrites_len = sizeof REWRITES / sizeof REWRITES[0],
 };
 
-/* ---- the one instance ---- */
+
 
 struct instance {
     int open;
@@ -105,8 +105,8 @@ struct instance {
 
 static struct instance THE_INSTANCE;
 
-/* THE instance lock: a ticket lock. `++` on an `_Atomic` object is one atomic read-modify-write
- * and a read of one is an atomic load (C11 6.5.2.4, 6.2.6.1), both sequentially consistent. */
+
+
 static _Atomic unsigned long NEXT_TICKET;
 static _Atomic unsigned long SERVING;
 
@@ -120,7 +120,7 @@ static void unlock(void) {
     SERVING++;
 }
 
-/* ---- helpers: no libc ---- */
+
 
 static void zero(volatile uint8_t *p, size_t n) {
     while (n--) {
@@ -136,8 +136,8 @@ static size_t length(const char *text) {
     return n;
 }
 
-/* Answer `outcome`: the plugin writes back its own `out` size (never more than the host's) and
- * mirrors the outcome it returns. */
+
+
 static bb_mech_RawOutcome answer(bb_mech_OutHead *head, size_t own, bb_mech_Outcome outcome) {
     if (head->size > own) {
         head->size = (uint32_t)own;
@@ -146,7 +146,7 @@ static bb_mech_RawOutcome answer(bb_mech_OutHead *head, size_t own, bb_mech_Outc
     return (bb_mech_RawOutcome)outcome;
 }
 
-/* A FAILED or REFUSED answer naming `text` (static) in `head.error`. */
+
 static bb_mech_RawOutcome say(bb_mech_OutHead *head, size_t own, bb_mech_Outcome outcome,
                               const char *text) {
     head->error.ptr = (const uint8_t *)text;
@@ -154,7 +154,7 @@ static bb_mech_RawOutcome say(bb_mech_OutHead *head, size_t own, bb_mech_Outcome
     return answer(head, own, outcome);
 }
 
-/* Copy `text` into a lent buffer of `cap` bytes; answers how many bytes were written. */
+
 static size_t lend(uint8_t *buf, size_t cap, const char *text) {
     size_t n = 0;
     if (buf == 0) {
@@ -167,9 +167,9 @@ static size_t lend(uint8_t *buf, size_t cap, const char *text) {
     return n;
 }
 
-/* Absent tail fields are zero, including a field only partly covered by in.size. Copy a whole
- * scalar's representation only after checking its complete boundary; never synthesize a partial
- * pointer or integer. The caller initializes `to` to its typed zero before asking for a field. */
+
+
+
 static void input_field(void *to, size_t width, const void *in, size_t size, size_t offset) {
     size_t k;
     uint8_t *dst = to;
@@ -182,8 +182,8 @@ static void input_field(void *to, size_t width, const void *in, size_t size, siz
     }
 }
 
-/* A blob's complete pointer/length can precede an omitted fmt/flags tail. Read each field at its
- * own boundary, rather than treating a partly present nested record as a bytewise struct copy. */
+
+
 static bb_mech_Blob input_blob(const void *in, size_t size, size_t offset) {
     bb_mech_Blob b = { 0 };
     input_field(&b.ptr, sizeof b.ptr, in, size, offset + offsetof(bb_mech_Blob, ptr));
@@ -193,7 +193,7 @@ static bb_mech_Blob input_blob(const void *in, size_t size, size_t offset) {
     return b;
 }
 
-/* ---- a JSON scanner: just enough to read the two settings shapes, and to refuse the rest ---- */
+
 
 struct cursor {
     const uint8_t *p;
@@ -206,7 +206,7 @@ static void ws(struct cursor *c) {
     }
 }
 
-/* Convert the scratch-held hex byte in place, without a separate material-bearing scalar local. */
+
 static int hex_in(volatile int *h) {
     if (*h >= '0' && *h <= '9') { *h -= '0'; return 1; }
     if (*h >= 'a' && *h <= 'f') { *h = *h - 'a' + 10; return 1; }
@@ -221,7 +221,7 @@ struct string_scratch {
     uint8_t enc[4];
 };
 
-/* [`string`]'s body; every selected material-bearing scalar lives in its caller's scratch. */
+
 static int string_in(struct cursor *c, uint8_t *out, size_t cap, size_t *len,
                      volatile struct string_scratch *s) {
     size_t n = 0;
@@ -271,11 +271,11 @@ static int string_in(struct cursor *c, uint8_t *out, size_t cap, size_t *len,
                 }
                 c->p += 4;
                 if (s->cp >= 0xDC00 && s->cp <= 0xDFFF) {
-                    return 0; /* a low surrogate with no high one before it */
+                    return 0;
                 }
                 if (s->cp >= 0xD800 && s->cp <= 0xDBFF) {
-                    /* RFC 8259 section 7: a character past the Basic Multilingual Plane is a
-                     * high surrogate escape followed by a low one; anything else is unpaired. */
+
+
                     s->lo = 0;
                     if (c->end - c->p < 6 || c->p[0] != '\\' || c->p[1] != 'u') {
                         return 0;
@@ -329,11 +329,11 @@ static int string_in(struct cursor *c, uint8_t *out, size_t cap, size_t *len,
     return 0;
 }
 
-/* One JSON string at the cursor, decoded into `out` (`cap` bytes; `out` may be 0 to only scan).
- * Answers 1 and the decoded length in `*len`, or 0 when it is not a well-formed string or does not
- * fit. \u escapes decode to UTF-8, a surrogate pair to its 4 bytes; an unpaired surrogate is
- * refused. Selected byte/codepoint scratch is volatile and zeroed on success and failure. This
- * concerns that memory only, not compiler-generated copies or registers. */
+
+
+
+
+
 static int string(struct cursor *c, uint8_t *out, size_t cap, size_t *len) {
     volatile struct string_scratch scratch = { 0 };
     int r = string_in(c, out, cap, len, &scratch);
@@ -390,7 +390,7 @@ static int number(struct cursor *c) {
     return 1;
 }
 
-/* Skip one well-formed JSON value at the cursor; answers 0 when there is none. */
+
 static int value(struct cursor *c, int depth) {
     size_t ignored;
     ws(c);
@@ -464,7 +464,7 @@ static int value(struct cursor *c, int depth) {
     }
 }
 
-/* Whether `ptr[0..len]` is exactly one JSON object (nothing but whitespace around it). */
+
 static int one_object(const uint8_t *ptr, size_t len) {
     struct cursor c;
     if (ptr == 0 || len == 0) {
@@ -480,14 +480,14 @@ static int one_object(const uint8_t *ptr, size_t len) {
     return c.p == c.end;
 }
 
-/* Whether the decoded key at the cursor equals `want` (`want_len` bytes); the cursor moves past it.
- * Answers -1 when the key is not a well-formed string. */
+
+
 static int key_is(struct cursor *c, const uint8_t *want, size_t want_len) {
     uint8_t key[MATERIAL_CAP];
     size_t n;
     struct cursor probe = *c;
     if (!string(&probe, key, sizeof key, &n)) {
-        /* Too long to hold: it cannot equal any name this plugin is asked for; skip it. */
+
         if (!string(c, 0, 0, &n)) {
             return -1;
         }
@@ -505,8 +505,8 @@ static int key_is(struct cursor *c, const uint8_t *want, size_t want_len) {
     return 1;
 }
 
-/* Inside a well-formed object (cursor just past its `{`): find member `want` and leave the cursor
- * at its value. Answers 1 when found. */
+
+
 static int member(struct cursor *c, const char *want_text, const uint8_t *want, size_t want_len) {
     if (want_text != 0) {
         want = (const uint8_t *)want_text;
@@ -524,7 +524,7 @@ static int member(struct cursor *c, const char *want_text, const uint8_t *want, 
             return 0;
         }
         ws(c);
-        c->p++; /* ':' (the object is well formed) */
+        c->p++;
         ws(c);
         if (is) {
             return 1;
@@ -566,8 +566,8 @@ static const char BAD_REFERENCE_OBJECT[] =
     "secret reference settings must be well-formed JSON, nested at most " TEXT(DEPTH_CAP)
     " deep, with no unpaired \\u surrogate";
 
-/* Whether a name before `upto` in the `values` object whose first entry starts at `from` decodes
- * to `name` (`len` bytes). Every name before `upto` was judged already, so each decodes whole. */
+
+
 static int named_before(const uint8_t *from, const uint8_t *upto, const uint8_t *end,
                         const uint8_t *name, size_t len) {
     uint8_t seen[MATERIAL_CAP];
@@ -588,19 +588,19 @@ static int named_before(const uint8_t *from, const uint8_t *upto, const uint8_t 
             }
         }
         ws(&c);
-        c.p++; /* ':' */
+        c.p++;
         if (!value(&c, 1)) {
             return 0;
         }
         ws(&c);
-        c.p++; /* ',' */
+        c.p++;
     }
 }
 
-/* Why the `values` object at the cursor (on its `{`) is not one this plugin serves, or 0; the
- * cursor ends past its `}`. Every entry is judged here, so `resolve` never meets a value it cannot
- * serve (an empty one, or one over MATERIAL_CAP) and every name kept can be asked for: none is
- * empty, over MATERIAL_CAP, or given twice. */
+
+
+
+
 static const char *values_refusal(struct cursor *c) {
     const uint8_t *first;
     c->p++;
@@ -617,7 +617,7 @@ static const char *values_refusal(struct cursor *c) {
         ws(c);
         at = c->p;
         if (!string(c, name, sizeof name, &n)) {
-            /* one_object already validated the key; only the name capacity can fail here. */
+
             return NAME_TOO_LARGE;
         }
         if (n == 0) {
@@ -627,7 +627,7 @@ static const char *values_refusal(struct cursor *c) {
             return NAME_TWICE;
         }
         ws(c);
-        c->p++; /* ':' */
+        c->p++;
         ws(c);
         if (c->p >= c->end || *c->p != '"' || !string(c, 0, 0, &n)) {
             return NOT_STRINGS;
@@ -643,13 +643,13 @@ static const char *values_refusal(struct cursor *c) {
             c->p++;
             continue;
         }
-        c->p++; /* '}' (the object is well formed) */
+        c->p++;
         return 0;
     }
 }
 
-/* Why `settings` is not this plugin's settings, or 0 when it is: one object whose one setting is
- * `values`; any other setting is refused, never ignored. */
+
+
 static const char *settings_refusal(const uint8_t *ptr, size_t len) {
     struct cursor c;
     int seen = 0;
@@ -681,7 +681,7 @@ static const char *settings_refusal(const uint8_t *ptr, size_t len) {
         }
         seen = 1;
         ws(&c);
-        c.p++; /* ':' */
+        c.p++;
         ws(&c);
         if (c.p >= c.end || *c.p != '{') {
             return NO_VALUES;
@@ -699,8 +699,8 @@ static const char *settings_refusal(const uint8_t *ptr, size_t len) {
     }
 }
 
-/* How many members the well-formed object `ptr[0..len]` has, when every one is named `want`;
- * -1 when one is named anything else. */
+
+
 static int only_member(const uint8_t *ptr, size_t len, const char *want) {
     int count = 0;
     struct cursor c;
@@ -719,7 +719,7 @@ static int only_member(const uint8_t *ptr, size_t len, const char *want) {
         }
         count++;
         ws(&c);
-        c.p++; /* ':' */
+        c.p++;
         if (!value(&c, 1)) {
             return -1;
         }
@@ -732,7 +732,7 @@ static int only_member(const uint8_t *ptr, size_t len, const char *want) {
     }
 }
 
-/* ---- the lifecycle ---- */
+
 
 static bb_mech_RawOutcome op_validate(void *inst, const void *in, void *out) {
     const bb_mech_InHead *head = in;
@@ -756,14 +756,14 @@ static bb_mech_RawOutcome op_validate(void *inst, const void *in, void *out) {
     if (why == 0) {
         return answer(o, sizeof *o, BB_MECH_Outcome_Ready);
     }
-    /* No instance holds the reason past the call: it goes into the host's lent buffer. */
+
     n = lend(err_buf, err_cap, why);
     o->error.ptr = err_buf;
     o->error.len = n;
     return answer(o, sizeof *o, BB_MECH_Outcome_Failed);
 }
 
-/* Keep `settings` as the instance's, or answer why not. */
+
 static const char *keep(struct instance *s, const bb_mech_Blob *settings) {
     const char *why = settings_refusal(settings->ptr, settings->len);
     size_t k;
@@ -861,7 +861,7 @@ static bb_mech_RawOutcome op_cancel(void *inst, const void *in, void *out) {
     return answer(&o->head, sizeof *o, BB_MECH_Outcome_Ready);
 }
 
-/* No lease is ever granted (a resolved value is the host's), so every release is refused. */
+
 static bb_mech_RawOutcome op_release(void *inst, const void *in, void *out) {
     bb_mech_OutHead *o = out;
     (void)inst;
@@ -871,7 +871,7 @@ static bb_mech_RawOutcome op_release(void *inst, const void *in, void *out) {
     if (in == 0) {
         return answer(o, sizeof *o, BB_MECH_Outcome_Fault);
     }
-    /* No lease, zero or otherwise, is served. Nothing in the input tail needs reading. */
+
     return say(o, sizeof *o, BB_MECH_Outcome_Refused, NO_LEASE);
 }
 
@@ -888,7 +888,7 @@ static bb_mech_RawOutcome op_close_held(void *inst, const void *in, void *out) {
     return answer(o, sizeof *o, BB_MECH_Outcome_Ready);
 }
 
-/* ---- the secret op ---- */
+
 
 static bb_mech_RawOutcome resolve_failed(bb_secret_ResolveOut *o, uint32_t kind, const char *text) {
     o->secret.ptr = 0;
@@ -920,7 +920,7 @@ static bb_mech_RawOutcome op_resolve_held(void *inst, const void *in, void *out)
                 offsetof(bb_secret_ResolveIn, secret_buf));
     input_field(&secret_cap, sizeof secret_cap, in, head->size,
                 offsetof(bb_secret_ResolveIn, secret_cap));
-    /* The name asked for: {"name": "<string>"}. No bytes at all is `{}` (the SDK's settings_of). */
+
     if (settings.len == 0) {
         return resolve_failed(o, BB_SECRET_ERROR_KIND_INVALID, MISSING_NAME);
     }
@@ -954,7 +954,7 @@ static bb_mech_RawOutcome op_resolve_held(void *inst, const void *in, void *out)
     }
     probe = c;
     if (!string(&c, name, sizeof name, &name_len)) {
-        /* A well-formed string too long to be held names nothing this plugin holds. */
+
         if (string(&probe, 0, 0, &name_len)) {
             return resolve_failed(o, BB_SECRET_ERROR_KIND_NOT_FOUND, NO_SUCH_NAME);
         }
@@ -964,7 +964,7 @@ static bb_mech_RawOutcome op_resolve_held(void *inst, const void *in, void *out)
         return resolve_failed(o, BB_SECRET_ERROR_KIND_INVALID,
                               "`name` in secret reference settings must not be blank");
     }
-    /* The instance's `values` (validated when it was kept). */
+
     c.p = s->settings;
     c.end = s->settings + s->settings_len;
     ws(&c);
@@ -976,20 +976,20 @@ static bb_mech_RawOutcome op_resolve_held(void *inst, const void *in, void *out)
     if (!member(&c, 0, name, name_len)) {
         return resolve_failed(o, BB_SECRET_ERROR_KIND_NOT_FOUND, NO_SUCH_NAME);
     }
-    /* Its decoded length first (a scan writes nothing), then the material itself, decoded straight
-     * into the host's buffer: no copy of it is made on this side. */
+
+
     probe = c;
     if (!string(&probe, 0, 0, &len)) {
         return resolve_failed(o, BB_SECRET_ERROR_KIND_INTERNAL,
                               "resolve: the kept settings hold a malformed value");
     }
     if (len == 0) {
-        /* Fail closed: an empty value is an error, never an empty success. */
+
         return resolve_failed(o, BB_SECRET_ERROR_KIND_INVALID,
                               "the material is EMPTY; a secret must be non-empty (fail-closed)");
     }
     if (secret_buf == 0 || len > secret_cap) {
-        /* THE SHORT-BUFFER ANSWER: nothing written, `needed` the full length, no error kind. */
+
         o->secret.ptr = 0;
         o->secret.len = 0;
         o->error_kind = BB_SECRET_ERROR_KIND_UNSET;
@@ -1011,10 +1011,10 @@ static bb_mech_RawOutcome op_resolve_held(void *inst, const void *in, void *out)
     return answer(&o->head, sizeof *o, BB_MECH_Outcome_Ready);
 }
 
-/* `check` (secret kind op 10): this plugin judges no reference at config time, so it answers
- * REFUSED, "not served": every reference passes, and `resolve` judges it (the secret kind's
- * `Ops::check` docs). The answer the SDK's unserved slot gives a Rust door that names none: a NULL
- * or short `out` is a FAULT, a NULL `in` is a FAULT, and nothing is written beyond the outcome. */
+
+
+
+
 static bb_mech_RawOutcome op_check(void *inst, const void *in, void *out) {
     bb_mech_OutHead *o = out;
     (void)inst;
@@ -1029,7 +1029,7 @@ static bb_mech_RawOutcome op_check(void *inst, const void *in, void *out) {
     return (bb_mech_RawOutcome)BB_MECH_Outcome_Refused;
 }
 
-/* ---- the ops that touch the instance, under its lock ---- */
+
 
 #define HELD(op)                                                                                   \
     static bb_mech_RawOutcome op(void *inst, const void *in, void *out) {                          \
@@ -1045,7 +1045,7 @@ HELD(op_refresh)
 HELD(op_close)
 HELD(op_resolve)
 
-/* ---- the table and the door ---- */
+
 
 static const bb_secret_Ops OPS = {
     .head = { .size = (uint32_t)sizeof(bb_secret_Ops),
@@ -1063,11 +1063,11 @@ static const bb_secret_Ops OPS = {
     .check = op_check,
 };
 
-/* Designated initializers (here and in OPS): a member the header adds later (the optional `ready`
- * tail op, a further secret op) is zero, i.e. absent, and -Wmissing-field-initializers stays quiet,
- * so this door compiles against the header at any pin. This plugin serves no `ready` and no
- * `migrate`. `layout` states the secret kind's layout fingerprint (the fold of the kind's table and
- * records this source was built against): the loader refuses a door whose fingerprint is not its own. */
+
+
+
+
+
 static const bb_mech_Door DOOR = {
     .magic = BB_MECH_DOOR_MAGIC,
     .mechanism_version = BB_MECH_MECHANISM_VERSION,
@@ -1082,8 +1082,8 @@ _Static_assert(offsetof(bb_mech_Door, layout) == 56 && sizeof(bb_mech_Door) == 6
                "the door states its layout fingerprint at offset 56 of a 64-byte door");
 
 #ifdef BUSBAR_SECRET_C_UNIT
-/* TEST ONLY (tests/unit.c, never in a plugin build): only the initialized byte array owned by
- * the instance. No struct representation or padding is lent to the observer. */
+
+
 const void *busbar_secret_c_instance(size_t *len);
 const void *busbar_secret_c_instance(size_t *len) {
     *len = THE_INSTANCE.settings_len;
@@ -1091,7 +1091,7 @@ const void *busbar_secret_c_instance(size_t *len) {
 }
 #endif
 
-/* THE ONE SYMBOL (BB_MECH_DOOR_SYMBOL). */
+
 DOOR_EXPORT const bb_mech_Door *busbar_plugin_door(void) {
     return &DOOR;
 }

@@ -1,22 +1,22 @@
 /*
  * SPDX-License-Identifier: Apache-2.0
  * Copyright (C) 2026 Busbar Inc and contributors
- *
- * busbar-secret-c's UNIT TESTS: the door driven directly, op by op, for what busbar's conformance
- * driver does not judge (it judges one malformed reference, and refreshes with good settings
- * before it resolves after a refused refresh). This file is NOT part of the plugin: plugin-ci compiles the .c files in secret-c/ only, and this
- * directory is beside them. It uses libc and pthreads; the plugin uses neither.
- *
- * Run (from the repo root, with busbar_plugin.h from busbar at .busbar-ref):
- *
- *   cc -std=c11 -Wall -Wextra -Werror -pedantic -fsanitize=thread -g -DBUSBAR_SECRET_C_UNIT \
- *     -I <busbar>/crates/busbar-contract/include \
- *     -o /tmp/secret-c-unit secret-c/busbar_secret_c.c secret-c/tests/unit.c -lpthread
- *   /tmp/secret-c-unit
- *
- * It exits 0 when every case passes. Under -fsanitize=thread, a data race between `refresh` and
- * `resolve` (the race the instance lock closes) is reported and fails the run. BUSBAR_SECRET_C_UNIT
- * exposes the one instance's memory to this file, so a case can prove what it holds.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
  */
 #define _POSIX_C_SOURCE 200809L
 #include "busbar_plugin.h"
@@ -55,7 +55,7 @@ static bb_mech_Blob blob(const char *text) {
     return b;
 }
 
-/* validate: READY (1) or the refusal text in `why`. */
+
 static int validate(const char *settings, char *why, size_t cap) {
     bb_mech_ValidateIn in;
     bb_mech_OutHead out;
@@ -122,7 +122,7 @@ static void close_instance(void *inst) {
 }
 
 
-/* open: the refusal text in `why` ("" when it opened; the instance is closed again). */
+
 static int open_text(const char *settings, char *why, size_t cap) {
     bb_mech_OpenIn in;
     bb_mech_OpenOut out;
@@ -144,7 +144,7 @@ static int open_text(const char *settings, char *why, size_t cap) {
     return 0;
 }
 
-/* refresh: the refusal text in `why`. */
+
 static int refresh_text(void *inst, const char *settings, char *why, size_t cap) {
     bb_mech_RefreshIn in;
     bb_mech_OutHead out;
@@ -162,7 +162,7 @@ static int refresh_text(void *inst, const char *settings, char *why, size_t cap)
     return 0;
 }
 
-/* resolve into the host's buffer `buf` (`buf_cap` bytes): the `out`, its error text in `why`. */
+
 static bb_secret_ResolveOut resolve_into(void *inst, const char *settings, uint8_t *buf,
                                          size_t buf_cap, char *why, size_t cap) {
     bb_secret_ResolveIn in;
@@ -180,13 +180,13 @@ static bb_secret_ResolveOut resolve_into(void *inst, const char *settings, uint8
         snprintf(why, cap, "%.*s", (int)out.head.error.len, (const char *)out.head.error.ptr);
     }
     if (out.head.outcome == BB_MECH_Outcome_Ready && out.head.lease != 0) {
-        /* A plugin that still leases: hand it back, as a host would. */
+
         release(inst, out.head.lease);
     }
     return out;
 }
 
-/* resolve: the outcome, its error kind and text (the host's buffer wiped after). */
+
 static int resolve(void *inst, const char *settings, uint32_t *kind, char *why, size_t cap) {
     uint8_t buf[BB_SECRET_FIRST_SECRET_CAP];
     bb_secret_ResolveOut out = resolve_into(inst, settings, buf, sizeof buf, why, cap);
@@ -195,9 +195,9 @@ static int resolve(void *inst, const char *settings, uint32_t *kind, char *why, 
     return out.head.outcome;
 }
 
-/* Register only the instance's written settings prefix. This static byte owner stays live and
- * initialized across refresh/close, so the previously registered prefix can witness its wipe.
- * Neither the instance representation nor the array's unwritten capacity is scanned. */
+
+
+
 static int held_copies(const char *needle) {
     static size_t initialized_len;
     size_t len, n = strlen(needle), k;
@@ -216,10 +216,10 @@ static int held_copies(const char *needle) {
 
 #define CANARY "ZEROIZE-CANARY-c-7f3e"
 
-/* THE CREDENTIAL CHIP, ROW 6 (host-owned secret bytes): a READY resolve writes the value into the
- * HOST'S buffer under no lease, and the plugin keeps no copy of it: its one instance holds the value
- * only where its settings name it, and nothing once it is closed. RED while resolve copied the value
- * into a lease of its own. */
+
+
+
+
 static void a_resolve_leaves_no_copy_behind(void) {
     char why[256];
     uint8_t buf[64];
@@ -246,8 +246,8 @@ static void a_resolve_leaves_no_copy_behind(void) {
     CHECK(held_copies(CANARY) == 0, "close wiped the settings: %d copies", held_copies(CANARY));
 }
 
-/* A value over the host's buffer is the short-buffer answer: FAILED, `needed` its full length,
- * nothing written, no error kind; a buffer that size then resolves it. */
+
+
 static void a_value_over_the_buffer_is_the_short_answer(void) {
     char why[256];
     uint8_t buf[64];
@@ -284,7 +284,7 @@ static void settings_are_judged_whole(void) {
     CHECK(!validate("{\"values\": {\"db\": \"\"}}", why, sizeof why) &&
               strcmp(why, "settings: a `values` entry is EMPTY; a secret must be non-empty (fail-closed)") == 0,
           "an empty value is refused at validate: '%s'", why);
-    /* 1025 bytes: one past the most a value may hold (MATERIAL_CAP). */
+
     strcpy(big_value, "{\"values\": {\"big\": \"");
     for (k = 0; k < 1025; k++) {
         strcat(big_value, "x");
@@ -325,8 +325,8 @@ static void references_name_only_a_non_empty_name(void) {
     close_instance(inst);
 }
 
-/* refresh and resolve on the one instance from two threads: under -fsanitize=thread the old
- * unlocked instance reports a data race here; every resolve of a held name must be READY. */
+
+
 enum { RACE_ITERATIONS = 2000 };
 static atomic_int refresher_started;
 static atomic_int refresher_go;
@@ -382,7 +382,7 @@ static int refresh_and_resolve_do_not_race(void) {
     status = pthread_join(t, 0);
     CHECK(status == 0, "pthread_join: %s", strerror(status));
     if (status != 0) {
-        /* The worker may still own inst: main must exit before more plugin operations. */
+
         return 0;
     }
     CHECK(atomic_load_explicit(&refresher_started, memory_order_acquire) == 1,
@@ -398,7 +398,7 @@ static int refresh_and_resolve_do_not_race(void) {
     return 1;
 }
 
-/* A value of exactly MATERIAL_CAP bytes is served whole. */
+
 static char cap_value[1100];
 
 static void a_value_at_the_cap_is_served(void) {
@@ -427,9 +427,9 @@ static void a_value_at_the_cap_is_served(void) {
     close_instance(inst);
 }
 
-/* Every name in `values` can be asked for: an empty one, one longer than a name may be, a name
- * given twice and `values` given twice are refused at validate, open and refresh alike, never kept
- * where no reference can reach them. */
+
+
+
 static char long_name[1100];
 
 static void every_kept_name_can_be_resolved(void) {
@@ -474,7 +474,7 @@ static void every_kept_name_can_be_resolved(void) {
     }
 }
 
-/* A refused refresh keeps the instance serving what it served. */
+
 static void a_refused_refresh_keeps_the_old_values(void) {
     char why[256];
     uint8_t buf[64];
@@ -494,7 +494,7 @@ static void a_refused_refresh_keeps_the_old_values(void) {
     close_instance(inst);
 }
 
-/* A reference names `name` once, as a string. */
+
 static void a_reference_names_name_once_as_a_string(void) {
     char why[256];
     uint32_t kind;
@@ -515,8 +515,8 @@ static void a_reference_names_name_once_as_a_string(void) {
     close_instance(inst);
 }
 
-/* RFC 8259 section 7: a character outside the Basic Multilingual Plane is escaped as a surrogate
- * pair; it decodes to its 4-byte UTF-8. An unpaired surrogate is refused, saying so. */
+
+
 static void a_surrogate_pair_decodes_to_utf8(void) {
     char why[256];
     uint8_t buf[64];
@@ -543,7 +543,7 @@ static void a_surrogate_pair_decodes_to_utf8(void) {
           "a high surrogate followed by a non-surrogate is refused");
 }
 
-/* An `out` shorter than its head is a FAULT, written nothing, at every op (as `check` answers). */
+
 static void a_short_out_is_a_fault(void) {
     bb_mech_ValidateIn vin;
     bb_mech_RefreshIn rin;
@@ -596,8 +596,8 @@ static void a_short_out_is_a_fault(void) {
     "settings: must be a JSON object; nested at most 32 deep, with no unpaired \\u surrogate"
 #define NONE_TEXT "settings: c requires settings (values); none provided"
 
-/* C4: instance settings of no bytes are refused saying a plugin requires them; a non-object says
- * so in the shared grammar. validate, open and refresh alike. */
+
+
 static void instance_settings_use_the_shared_grammar(void) {
     char why[256];
     void *inst;
@@ -620,8 +620,8 @@ static void instance_settings_use_the_shared_grammar(void) {
     }
 }
 
-/* C1/C5: the reference refusals in the vault grammar (the kernel adds the module prefix), and an
- * empty reference blob is `{}` (the SDK's settings_of). */
+
+
 static void reference_refusals_use_the_vault_grammar(void) {
     char why[256];
     uint32_t kind;
@@ -649,8 +649,8 @@ static void reference_refusals_use_the_vault_grammar(void) {
     close_instance(inst);
 }
 
-/* C2: the empty-material text carries the shared tail. validate refuses an empty value, so a kept
- * `values` entry is made empty in place (same length, trailing blank) to reach resolve's guard. */
+
+
 static void resolve_refuses_empty_material_in_the_shared_words(void) {
     char why[256];
     uint32_t kind;
@@ -678,7 +678,7 @@ static void resolve_refuses_empty_material_in_the_shared_words(void) {
     close_instance(inst);
 }
 
-/* C3: release is refused, SDK words first. */
+
 static void release_is_refused_in_the_sdk_words(void) {
     bb_mech_ReleaseIn in;
     bb_mech_OutHead out;
@@ -695,7 +695,7 @@ static void release_is_refused_in_the_sdk_words(void) {
           "release text: '%s'", why);
 }
 
-/* C7: the Statement states its config word: one REWRITE_ALIAS from `secret-c`. */
+
 static void the_statement_states_its_alias(void) {
     const bb_mech_Statement *st = busbar_plugin_door()->statement;
     CHECK(st->rewrites != 0 && st->rewrites_len == 1, "one rewrite: len %llu",
@@ -708,7 +708,7 @@ static void the_statement_states_its_alias(void) {
     }
 }
 
-/* C6: an `out` shorter than its head (or NULL) is a FAULT at open, resolve, tick and cancel too. */
+
 static void a_short_out_is_a_fault_at_the_rest(void) {
     bb_mech_OpenIn oin;
     bb_mech_OpenOut oout;
@@ -759,7 +759,7 @@ static void a_short_out_is_a_fault_at_the_rest(void) {
     close_instance(inst);
 }
 
-/* The following cases call the existing public door, including all three settings entry points. */
+
 static void refused_settings_everywhere(const char *settings, const char *expected) {
     char why[256];
     void *inst;
@@ -894,7 +894,7 @@ static void depth_and_malformed_reference_diagnostics_name_the_cause(void) {
     const char *bad[] = { "{\"name\":\"\\ud800\"}", "{\"name\":\"\\udc00\"}",
                           "{\"name\":\"db\"} trailing", "{\"name\":\"\\q\"}" };
     void *inst;
-    /* Root object depth is zero: 31 arrays put their scalar at 32; 32 put it at 33. */
+
     nested_extra(text, "{\"values\":{},\"extra\":", 31);
     refused_settings_everywhere(text, "settings: `values` is the only setting");
     nested_extra(text, "{\"values\":{},\"extra\":", 32);
@@ -991,7 +991,7 @@ static void a_second_open_keeps_the_first_instance_and_check_stays_unserved(void
     close_instance(inst);
 }
 
-/* Search only the bytes a door answer lends, including non-NUL-terminated error text. */
+
 static int text_contains(const uint8_t *text, size_t len, const char *needle) {
     size_t n = strlen(needle), k;
     if (text == 0 || n > len) {
@@ -1022,9 +1022,9 @@ static void refusal_contains_no_credential(const bb_mech_OutHead *head, const ui
     }
 }
 
-/* Valid material precedes each error: every settings entry point must refuse without echoing
- * that material or retaining the rejected candidate, and a refused refresh must keep serving old
- * bytes. These are coverage controls through the existing ABI, not a claimed baseline RED. */
+
+
+
 static void refused_candidates_are_not_echoed_or_kept(void) {
     static const struct {
         const char *settings;
@@ -1118,8 +1118,8 @@ static void refused_candidates_are_not_echoed_or_kept(void) {
     }
 }
 
-/* C1: old hosts may omit append-only input tails. Drive the existing door with actual prefix
- * records as well as every byte boundary of the pointer/capacity tails. No partial field is live. */
+
+
 static bb_secret_ResolveOut resolve_raw(void *inst, const void *in) {
     bb_secret_ResolveOut out;
     memset(&out, 0, sizeof out);
