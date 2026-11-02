@@ -760,6 +760,13 @@ static void instance_settings_use_the_shared_grammar(void) {
           "validate: empty settings: '%s'", why);
     CHECK(!open_text("", why, sizeof why) && strcmp(why, NONE_TEXT) == 0,
           "open: empty settings: '%s'", why);
+    CHECK(!validate("{}", why, sizeof why) && strcmp(why, NONE_TEXT) == 0,
+          "validate: settings with no `values`: '%s'", why);
+    CHECK(!open_text("{}", why, sizeof why) && strcmp(why, NONE_TEXT) == 0,
+          "open: settings with no `values`: '%s'", why);
+    CHECK(!validate("{\"values\": []}", why, sizeof why) &&
+              strcmp(why, "settings: `values` must be an object") == 0,
+          "validate: a wrong-typed `values` keeps the type text: '%s'", why);
     CHECK(!validate("[]", why, sizeof why) && strcmp(why, NOT_OBJECT_TEXT) == 0,
           "validate: a non-object: '%s'", why);
     CHECK(!open_text("[]", why, sizeof why) && strcmp(why, NOT_OBJECT_TEXT) == 0,

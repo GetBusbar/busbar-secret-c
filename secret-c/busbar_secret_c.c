@@ -638,7 +638,7 @@ static const char *settings_refusal(const uint8_t *ptr, size_t len) {
     c.p++;
     ws(&c);
     if (c.p < c.end && *c.p == '}') {
-        return NO_VALUES;
+        return NO_SETTINGS; /* no `values` at all: not given, not mistyped */
     }
     for (;;) {
         const char *why;
