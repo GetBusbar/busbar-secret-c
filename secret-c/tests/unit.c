@@ -566,8 +566,8 @@ static void an_accepted_refresh_serves_the_new_value(void) {
               memcmp(buf, "two", 3) == 0,
           "the refresh serves the new value: outcome %u len %llu '%s'", out.head.outcome,
           (unsigned long long)out.secret.len, why);
-    CHECK(held_copies("one-longer") == 0, "the old settings were zeroed: %d copies",
-          held_copies("one-longer"));
+    CHECK(held_copies("nger") == 0, "the old settings were zeroed: %d copies",
+          held_copies("nger"));
     memset(buf, 0, sizeof buf);
     close_instance(inst);
 }
@@ -944,7 +944,7 @@ static void nesting_is_capped(void) {
     char why[256];
     uint32_t kind;
     void *inst;
-        nest(32, "{\"values\": {\"db\": \"x\"}, \"x\": ", "", "}");
+    nest(32, "{\"values\": {\"db\": \"x\"}, \"x\": ", "", "}");
     CHECK(!validate(deep, why, sizeof why) && strcmp(why, "settings: `values` is the only setting") == 0,
           "32 arrays deep parses (refused as another setting): '%s'", why);
     nest(33, "{\"values\": {\"db\": \"x\"}, \"x\": ", "", "}");
