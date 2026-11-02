@@ -1628,49 +1628,22 @@ static void check_and_short_in_frames(void) {
     input_prefixes_default_only_whole_fields();
 }
 
-#if defined(__SANITIZE_THREAD__)
-#define UNDER_TSAN 1
-#elif defined(__has_feature)
-#if __has_feature(thread_sanitizer)
-#define UNDER_TSAN 1
-#endif
-#endif
-#ifndef UNDER_TSAN
-#if defined(__GNUC__)
-__attribute__((noinline))
-#endif
-static int dead_stack_holds(uint32_t a, uint32_t b) {
-    volatile uint8_t probe[8192];
-    size_t k;
-    int found = 0;
-    for (k = 0; k + 4 <= sizeof probe; k += 4) {
-        uint32_t w = (uint32_t)probe[k] | ((uint32_t)probe[k + 1] << 8) |
-                     ((uint32_t)probe[k + 2] << 16) | ((uint32_t)probe[k + 3] << 24);
-        if (w == a || w == b) {
-            found++;
-        }
-    }
-    return found;
-}
-
-#if defined(__GNUC__)
-__attribute__((noinline))
-#endif
-static void validate_the_pair(void) {
-    char why[256];
-    CHECK(validate("{\"values\": {\"api\": \"k\\ud83d\\udca9y\"}}", why, sizeof why),
-          "the pair validates: %s", why);
-}
+void busbar_secret_c_reset_scratch_check(void);
+int busbar_secret_c_scratch_is_cleared(void);
 
 static void the_decoding_scratch_is_wiped(void) {
-    validate_the_pair();
-    CHECK(dead_stack_holds(0x1F4A9u, 0xDCA9u) == 0,
-          "a decoded code point stayed on the dead stack");
+    char why[256];
+    busbar_secret_c_reset_scratch_check();
+    CHECK(validate("{\"values\":{\"api\":\"k\\ud83d\\udca9y\"}}", why, sizeof why),
+          "the surrogate pair validates: %s", why);
+    CHECK(busbar_secret_c_scratch_is_cleared(),
+          "successful decoding clears its live code point, surrogate, hex and encoded scratch");
+    busbar_secret_c_reset_scratch_check();
+    CHECK(!validate("{\"values\":{\"api\":\"k\\ud83dX\"}}", why, sizeof why),
+          "an incomplete surrogate is refused");
+    CHECK(busbar_secret_c_scratch_is_cleared(),
+          "failed decoding clears its live code point, surrogate, hex and encoded scratch");
 }
-#else
-static void the_decoding_scratch_is_wiped(void) {}
-#endif
-
 
 int main(void) {
     a_resolve_leaves_no_copy_behind();

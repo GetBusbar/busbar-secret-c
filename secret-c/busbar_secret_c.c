@@ -221,6 +221,19 @@ struct string_scratch {
     uint8_t enc[4];
 };
 
+#ifdef BUSBAR_SECRET_C_UNIT
+static _Atomic int decoding_scratch_cleared = 1;
+
+static void record_cleared_scratch(const volatile uint8_t *bytes, size_t len) {
+    size_t k;
+    for (k = 0; k < len; k++) {
+        if (bytes[k] != 0) {
+            decoding_scratch_cleared = 0;
+        }
+    }
+}
+#endif
+
 
 static int string_in(struct cursor *c, uint8_t *out, size_t cap, size_t *len,
                      volatile struct string_scratch *s) {
@@ -338,6 +351,9 @@ static int string(struct cursor *c, uint8_t *out, size_t cap, size_t *len) {
     volatile struct string_scratch scratch = { 0 };
     int r = string_in(c, out, cap, len, &scratch);
     zero((volatile uint8_t *)&scratch, sizeof scratch);
+#ifdef BUSBAR_SECRET_C_UNIT
+    record_cleared_scratch((const volatile uint8_t *)&scratch, sizeof scratch);
+#endif
     return r;
 }
 
@@ -1082,6 +1098,17 @@ _Static_assert(offsetof(bb_mech_Door, layout) == 56 && sizeof(bb_mech_Door) == 6
                "the door states its layout fingerprint at offset 56 of a 64-byte door");
 
 #ifdef BUSBAR_SECRET_C_UNIT
+
+void busbar_secret_c_reset_scratch_check(void);
+int busbar_secret_c_scratch_is_cleared(void);
+
+void busbar_secret_c_reset_scratch_check(void) {
+    decoding_scratch_cleared = 1;
+}
+
+int busbar_secret_c_scratch_is_cleared(void) {
+    return decoding_scratch_cleared;
+}
 
 
 const void *busbar_secret_c_instance(size_t *len);
