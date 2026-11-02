@@ -84,6 +84,10 @@ cc -std=c11 -Wall -Wextra -Werror -pedantic -fsanitize=thread -g -DBUSBAR_SECRET
   secret-c/busbar_secret_c.c secret-c/tests/unit.c -lpthread && /tmp/secret-c-unit
 ```
 
+The case that reads the dead stack for decoding scratch needs a build without
+`-fsanitize=thread` (the sanitizer's own spills would fail it): run the same command once more
+with that flag removed.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).

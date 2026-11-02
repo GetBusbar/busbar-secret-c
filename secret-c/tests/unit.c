@@ -265,6 +265,57 @@ static void a_value_over_the_buffer_is_the_short_answer(void) {
     close_instance(inst);
 }
 
+/* ThreadSanitizer's instrumentation spills the compiler's own temporaries into the plugin's frames
+ * (copies no source line holds), so this case reads the stack only in a build without it: build
+ * the unit tests once as above and once without -fsanitize=thread. */
+#if defined(__SANITIZE_THREAD__)
+#define UNDER_TSAN 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define UNDER_TSAN 1
+#endif
+#endif
+
+/* The decoding scratch is wiped before string() returns: a material's \u-decoded code point (and
+ * the low half of a surrogate pair) must not survive in the dead frame. After validate scans a
+ * value holding U+1F4A9 spelled as a surrogate pair, the stack below this frame is read back for
+ * the code point (0x1F4A9) and the low surrogate (0xDCA9). */
+#ifndef UNDER_TSAN
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
+static int dead_stack_holds(uint32_t a, uint32_t b) {
+    volatile uint8_t probe[8192];
+    size_t k;
+    int found = 0;
+    for (k = 0; k + 4 <= sizeof probe; k += 4) {
+        uint32_t w = (uint32_t)probe[k] | ((uint32_t)probe[k + 1] << 8) |
+                     ((uint32_t)probe[k + 2] << 16) | ((uint32_t)probe[k + 3] << 24);
+        if (w == a || w == b) {
+            found++;
+        }
+    }
+    return found;
+}
+
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
+static void validate_the_pair(void) {
+    char why[256];
+    CHECK(validate("{\"values\": {\"api\": \"k\\ud83d\\udca9y\"}}", why, sizeof why),
+          "the pair validates: %s", why);
+}
+
+static void the_decoding_scratch_is_wiped(void) {
+    validate_the_pair();
+    CHECK(dead_stack_holds(0x1F4A9u, 0xDCA9u) == 0,
+          "a decoded code point stayed on the dead stack");
+}
+#else
+static void the_decoding_scratch_is_wiped(void) {}
+#endif
+
 static char big_value[2200];
 
 static void settings_are_judged_whole(void) {
@@ -1059,6 +1110,7 @@ static void check_and_short_in_frames(void) {
 int main(void) {
     a_resolve_leaves_no_copy_behind();
     a_value_over_the_buffer_is_the_short_answer();
+    the_decoding_scratch_is_wiped();
     settings_are_judged_whole();
     the_settings_cap_is_enforced_at_its_boundary();
     references_name_only_a_non_empty_name();

@@ -187,8 +187,17 @@ static int hex(uint8_t h) {
     return -1;
 }
 
-/* [`string`]'s body, decoding through the caller's 4-byte scratch `enc`. */
-static int string_in(struct cursor *c, uint8_t *out, size_t cap, size_t *len, uint8_t *enc) {
+/* The decoding scratch, owned by [`string`] so it can wipe all of it: the encoded bytes and the
+ * code point (and a surrogate pair's low half) they came from. */
+struct scratch {
+    uint8_t enc[4];
+    uint32_t cp, lo;
+};
+
+/* [`string`]'s body, decoding through the caller's scratch. */
+static int string_in(struct cursor *c, uint8_t *out, size_t cap, size_t *len,
+                     struct scratch *sc) {
+    uint8_t *enc = sc->enc;
     size_t n = 0;
     if (c->p >= c->end || *c->p != '"') {
         return 0;
@@ -196,7 +205,6 @@ static int string_in(struct cursor *c, uint8_t *out, size_t cap, size_t *len, ui
     c->p++;
     while (c->p < c->end) {
         uint8_t b = *c->p++;
-        uint32_t cp;
         size_t k, m;
         if (b == '"') {
             *len = n;
@@ -227,22 +235,22 @@ static int string_in(struct cursor *c, uint8_t *out, size_t cap, size_t *len, ui
                 if (c->end - c->p < 4) {
                     return 0;
                 }
-                cp = 0;
+                sc->cp = 0;
                 for (k = 0; k < 4; k++) {
                     int h = hex(c->p[k]);
                     if (h < 0) {
                         return 0;
                     }
-                    cp = cp * 16 + (uint32_t)h;
+                    sc->cp = sc->cp * 16 + (uint32_t)h;
                 }
                 c->p += 4;
-                if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                if (sc->cp >= 0xDC00 && sc->cp <= 0xDFFF) {
                     return 0; /* a low surrogate with no high one before it */
                 }
-                if (cp >= 0xD800 && cp <= 0xDBFF) {
+                if (sc->cp >= 0xD800 && sc->cp <= 0xDBFF) {
                     /* RFC 8259 section 7: a character past the Basic Multilingual Plane is a
                      * high surrogate escape followed by a low one; anything else is unpaired. */
-                    uint32_t lo = 0;
+                    sc->lo = 0;
                     if (c->end - c->p < 6 || c->p[0] != '\\' || c->p[1] != 'u') {
                         return 0;
                     }
@@ -251,30 +259,30 @@ static int string_in(struct cursor *c, uint8_t *out, size_t cap, size_t *len, ui
                         if (h < 0) {
                             return 0;
                         }
-                        lo = lo * 16 + (uint32_t)h;
+                        sc->lo = sc->lo * 16 + (uint32_t)h;
                     }
-                    if (lo < 0xDC00 || lo > 0xDFFF) {
+                    if (sc->lo < 0xDC00 || sc->lo > 0xDFFF) {
                         return 0;
                     }
                     c->p += 6;
-                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                    sc->cp = 0x10000 + ((sc->cp - 0xD800) << 10) + (sc->lo - 0xDC00);
                 }
-                if (cp < 0x80) {
-                    enc[0] = (uint8_t)cp;
-                } else if (cp < 0x800) {
-                    enc[0] = (uint8_t)(0xC0 | (cp >> 6));
-                    enc[1] = (uint8_t)(0x80 | (cp & 0x3F));
+                if (sc->cp < 0x80) {
+                    enc[0] = (uint8_t)sc->cp;
+                } else if (sc->cp < 0x800) {
+                    enc[0] = (uint8_t)(0xC0 | (sc->cp >> 6));
+                    enc[1] = (uint8_t)(0x80 | (sc->cp & 0x3F));
                     m = 2;
-                } else if (cp < 0x10000) {
-                    enc[0] = (uint8_t)(0xE0 | (cp >> 12));
-                    enc[1] = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));
-                    enc[2] = (uint8_t)(0x80 | (cp & 0x3F));
+                } else if (sc->cp < 0x10000) {
+                    enc[0] = (uint8_t)(0xE0 | (sc->cp >> 12));
+                    enc[1] = (uint8_t)(0x80 | ((sc->cp >> 6) & 0x3F));
+                    enc[2] = (uint8_t)(0x80 | (sc->cp & 0x3F));
                     m = 3;
                 } else {
-                    enc[0] = (uint8_t)(0xF0 | (cp >> 18));
-                    enc[1] = (uint8_t)(0x80 | ((cp >> 12) & 0x3F));
-                    enc[2] = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));
-                    enc[3] = (uint8_t)(0x80 | (cp & 0x3F));
+                    enc[0] = (uint8_t)(0xF0 | (sc->cp >> 18));
+                    enc[1] = (uint8_t)(0x80 | ((sc->cp >> 12) & 0x3F));
+                    enc[2] = (uint8_t)(0x80 | ((sc->cp >> 6) & 0x3F));
+                    enc[3] = (uint8_t)(0x80 | (sc->cp & 0x3F));
                     m = 4;
                 }
                 break;
@@ -300,9 +308,9 @@ static int string_in(struct cursor *c, uint8_t *out, size_t cap, size_t *len, ui
  * fit. \u escapes decode to UTF-8, a surrogate pair to its 4 bytes; an unpaired surrogate is
  * refused. The decoding scratch (a decoded material's last bytes) is zeroed before it returns. */
 static int string(struct cursor *c, uint8_t *out, size_t cap, size_t *len) {
-    uint8_t enc[4] = { 0, 0, 0, 0 };
-    int r = string_in(c, out, cap, len, enc);
-    zero(enc, sizeof enc);
+    struct scratch sc = { { 0, 0, 0, 0 }, 0, 0 };
+    int r = string_in(c, out, cap, len, &sc);
+    zero((volatile uint8_t *)&sc, sizeof sc);
     return r;
 }
 
