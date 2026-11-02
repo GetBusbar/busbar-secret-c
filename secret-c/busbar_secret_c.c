@@ -532,7 +532,8 @@ static const char NO_LEASE[] =
     "release: no such lease (a resolved value is written into the host's buffer, never leased)";
 static const char MISSING_NAME[] = "missing or non-string `name` in secret reference settings";
 static const char NO_SUCH_NAME[] = "c holds no secret by that name";
-static const char TOO_LARGE[] = "settings: larger than this plugin keeps";
+static const char TOO_LARGE[] =
+    "settings: larger than " TEXT(SETTINGS_CAP) " bytes, the most this plugin keeps";
 
 /* Whether a name before `upto` in the `values` object whose first entry starts at `from` decodes
  * to `name` (`len` bytes). Every name before `upto` was judged already, so each decodes whole. */

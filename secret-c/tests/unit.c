@@ -353,7 +353,8 @@ static char settings_8192[8193 + 64];
 
 static void the_settings_cap_is_enforced_at_its_boundary(void) {
     static const char head[] = "{\"values\": {\"db\": \"x\"}}";
-    static const char over[] = "settings: larger than this plugin keeps";
+    static const char over[] =
+        "settings: larger than 8192 bytes, the most this plugin keeps";
     char why[256];
     size_t k, n = strlen(head);
     void *inst;
