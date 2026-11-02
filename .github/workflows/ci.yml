@@ -39,5 +39,6 @@ jobs:
       plugin_kind: secret
       plugin_alias: secret-c
       plugin_lang: c
+      source_role: c_abi_test
       c_dir: secret-c
     secrets: inherit

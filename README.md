@@ -1,27 +1,24 @@
-<!-- fleet:header:begin (rendered by `busbar-release plugin heal` from GetBusbar/busbar-release template/ and busbar's plugins.yaml; edit it there) -->
-# busbar-secret-c
+# C memory ABI integration test
 
-First-party signed kind:secret plugin library, written in C from busbar_plugin.h alone: the c secret, packaged as a droppable busbar plugin. Drop the signed tarball into plugins/.
-
-| kind | alias | crate | busbar | license |
-|---|---|---|---|---|
-| `secret` | `secret-c` | `busbar-secret-c` | 1.6.0 (pinned in `.busbar-ref`) | Apache-2.0 |
+This repository supplies the external C input for Busbar's header-only build, dynamic loading,
+and ABI-refusal tests. It uses the secret ABI table to exercise host-owned buffers and lifecycle
+calls. Its repository name and history remain available for reproducible test inputs.
 
 [![ci](https://github.com/GetBusbar/busbar-secret-c/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/GetBusbar/busbar-secret-c/actions/workflows/ci.yml)
-<!-- fleet:header:end -->
 
 ## What it is for
 
-`busbar-secret-c` is a `kind: secret` busbar plugin written in C from busbar's generated header
+The ABI fixture is written in C from busbar's generated header
 (`busbar_plugin.h`) alone: no Rust, no busbar crate, no libc header, no allocator. It is decision
 #84's witness (BUSBAR-1.6.0.md): a third party builds a busbar plugin from the header alone, and
 busbar loads it through the same dropped-in door as every Rust plugin.
 
-It serves named secrets whose material is written in its own settings.
+Its test settings contain named values, allowing tests to check exact buffer contents, custody,
+refusal handling, and refresh behavior.
 
-## Config
+## Fixture input
 
-Configured under the `secret-c` module name (the Statement states it as its own alias):
+The fixture Statement uses the `secret-c` alias:
 `{ module: secret-c, settings: { name: db } }` for a reference. The instance's settings name each
 secret and its material:
 
@@ -75,20 +72,18 @@ release.
 
 ## Tests
 
-CI (busbar's `plugin-ci.yml` at the pin, `plugin_lang: c`) builds the library as above, loads it
-through busbar's plugin loader (`load_dropped`) and drives the `kind: secret` conformance script
-over `secret-c/conformance.json`, with its RED arm (the sources rebuilt at another kind ABI are
-refused). Locally, from a busbar checkout at the pin:
+CI uses `plugin_lang: c` and `source_role: c_abi_test`. It builds from the public header, then runs
+the ordinary loader integration target over the actual library. The target checks dynamic
+loading and host-buffer exchange, exact rejection of older/newer kind ABIs, and manifest-kind
+refusal. From a Busbar checkout at the pin:
 
 ```bash
-BUSBAR_DROPPED_LIB=$PWD/target/libbusbar_secret_c.so BUSBAR_DROPPED_SOURCES=$PWD/secret-c \
-BUSBAR_DROPPED_SCRIPT=$PWD/secret-c/conformance.json \
-  cargo run --manifest-path <busbar>/Cargo.toml --locked -p busbar-test-kit \
-  --example dropped_conformance
+BUSBAR_C_ABI_LIBRARY=$PWD/target/libbusbar_secret_c.so BUSBAR_C_ABI_SOURCES=$PWD/secret-c \
+  cargo test --manifest-path <busbar>/Cargo.toml --locked -p busbar-plugin-loader --test c_abi
 ```
 
 The unit tests (`secret-c/tests/unit.c`, not part of the plugin) drive the door directly for
-what the conformance script does not judge, including input field boundaries, refresh custody
+input field boundaries, refresh custody
 and credential-bearing refusals. The current normal CI `cunit` check runs them under
 ThreadSanitizer. To run them locally:
 
@@ -97,6 +92,10 @@ cc -std=c11 -Wall -Wextra -Werror -pedantic -fsanitize=thread -g -DBUSBAR_SECRET
   -I <busbar>/crates/busbar-contract/include -o /tmp/secret-c-unit \
   secret-c/busbar_secret_c.c secret-c/tests/unit.c -lpthread && /tmp/secret-c-unit
 ```
+
+The case that reads the dead stack for decoding scratch needs a build without
+`-fsanitize=thread` (the sanitizer's own spills would fail it): run the same command once more
+with that flag removed.
 
 ## License
 

@@ -258,16 +258,20 @@ static void a_value_over_the_buffer_is_the_short_answer(void) {
     if (inst == 0) {
         return;
     }
-    memset(buf, 0, sizeof buf);
+    memset(buf, 0xA5, sizeof buf);
     out = resolve_into(inst, "{\"name\": \"db\"}", buf, n - 1, why, sizeof why);
     CHECK(out.head.outcome == BB_MECH_Outcome_Failed && out.needed == n &&
               out.error_kind == BB_SECRET_ERROR_KIND_UNSET && out.secret.ptr == 0,
           "short: outcome %u needed %llu kind %u", out.head.outcome,
           (unsigned long long)out.needed, out.error_kind);
-    CHECK(buf[0] == 0, "a short answer writes nothing");
+    CHECK(buf[0] == 0xA5, "a short answer writes nothing");
+    memset(buf, 0xA5, sizeof buf);
     out = resolve_into(inst, "{\"name\": \"db\"}", buf, n, why, sizeof why);
     CHECK(out.head.outcome == BB_MECH_Outcome_Ready && out.secret.len == n,
           "the re-call with the size it named resolves");
+    CHECK(memcmp(buf, CANARY, n) == 0, "the exact-fit value is written whole");
+    CHECK(buf[n] == 0xA5, "nothing is written past the host's buffer (byte after: 0x%02x)",
+          buf[n]);
     memset(buf, 0, sizeof buf);
     close_instance(inst);
 }
@@ -464,14 +468,13 @@ static void every_kept_name_can_be_resolved(void) {
     if (inst == 0) {
         return;
     }
-    CHECK(!refresh(inst, "{\"values\": {\"db\": \"one\", \"db\": \"two\"}}"),
-          "refresh refuses a name given twice");
+    CHECK(!refresh_text(inst, "{\"values\": {\"db\": \"one\", \"db\": \"two\"}}", why, sizeof why) &&
+              strcmp(why, "settings: a `values` name is given more than once") == 0,
+          "refresh refuses a name given twice: '%s'", why);
     close_instance(inst);
-    inst = open_instance("{\"values\": {\"\": \"x\"}}");
-    CHECK(inst == 0, "open refuses an empty name");
-    if (inst != 0) {
-        close_instance(inst);
-    }
+    CHECK(!open_text("{\"values\": {\"\": \"x\"}}", why, sizeof why) &&
+              strcmp(why, "settings: a `values` name is empty") == 0,
+          "open refuses an empty name: '%s'", why);
 }
 
 
@@ -484,7 +487,10 @@ static void a_refused_refresh_keeps_the_old_values(void) {
     if (inst == 0) {
         return;
     }
-    CHECK(!refresh(inst, "{\"values\": {\"db\": \"\"}}"), "an empty value is refused at refresh");
+    CHECK(!refresh_text(inst, "{\"values\": {\"db\": \"\"}}", why, sizeof why) &&
+              strcmp(why, "settings: a `values` entry is EMPTY; a secret must be non-empty "
+                          "(fail-closed)") == 0,
+          "an empty value is refused at refresh: '%s'", why);
     memset(buf, 0, sizeof buf);
     out = resolve_into(inst, "{\"name\": \"db\"}", buf, sizeof buf, why, sizeof why);
     CHECK(out.head.outcome == BB_MECH_Outcome_Ready && out.secret.len == 3 &&
@@ -605,6 +611,13 @@ static void instance_settings_use_the_shared_grammar(void) {
           "validate: empty settings: '%s'", why);
     CHECK(!open_text("", why, sizeof why) && strcmp(why, NONE_TEXT) == 0,
           "open: empty settings: '%s'", why);
+    CHECK(!validate("{}", why, sizeof why) && strcmp(why, "settings: `values` is required") == 0,
+          "validate: settings with no `values`: '%s'", why);
+    CHECK(!open_text("{}", why, sizeof why) && strcmp(why, "settings: `values` is required") == 0,
+          "open: settings with no `values`: '%s'", why);
+    CHECK(!validate("{\"values\": []}", why, sizeof why) &&
+              strcmp(why, "settings: `values` must be an object") == 0,
+          "validate: a wrong-typed `values` keeps the type text: '%s'", why);
     CHECK(!validate("[]", why, sizeof why) && strcmp(why, NOT_OBJECT_TEXT) == 0,
           "validate: a non-object: '%s'", why);
     CHECK(!open_text("[]", why, sizeof why) && strcmp(why, NOT_OBJECT_TEXT) == 0,
@@ -1320,6 +1333,282 @@ static void input_prefixes_default_only_whole_fields(void) {
     close_instance(inst);
 }
 
+static char settings_8192[8193 + 64];
+
+static void the_settings_cap_is_enforced_at_its_boundary(void) {
+    static const char head[] = "{\"values\": {\"db\": \"x\"}}";
+    static const char over[] =
+        "settings: larger than 8192 bytes, the most this plugin keeps";
+    char why[256];
+    size_t k, n = strlen(head);
+    void *inst;
+    uint8_t buf[8];
+    bb_secret_ResolveOut out;
+    memcpy(settings_8192, head, n);
+    for (k = n; k < 8192; k++) {
+        settings_8192[k] = ' ';
+    }
+    settings_8192[8192] = 0;
+    CHECK(validate(settings_8192, why, sizeof why), "8192 bytes validate: '%s'", why);
+    inst = open_instance(settings_8192);
+    CHECK(inst != 0, "8192 bytes open");
+    if (inst != 0) {
+        memset(buf, 0, sizeof buf);
+        out = resolve_into(inst, "{\"name\": \"db\"}", buf, sizeof buf, why, sizeof why);
+        CHECK(out.head.outcome == BB_MECH_Outcome_Ready && out.secret.len == 1 && buf[0] == 'x',
+              "8192 bytes are kept whole and served");
+        settings_8192[8192] = ' ';
+        settings_8192[8193] = 0;
+        CHECK(!refresh_text(inst, settings_8192, why, sizeof why) && strcmp(why, over) == 0,
+              "refresh refuses 8193 bytes: '%s'", why);
+        out = resolve_into(inst, "{\"name\": \"db\"}", buf, sizeof buf, why, sizeof why);
+        CHECK(out.head.outcome == BB_MECH_Outcome_Ready && out.secret.len == 1,
+              "a refused over-cap refresh kept the old settings");
+        close_instance(inst);
+    }
+    settings_8192[8192] = ' ';
+    settings_8192[8193] = 0;
+    CHECK(!validate(settings_8192, why, sizeof why) && strcmp(why, over) == 0,
+          "validate refuses 8193 bytes: '%s'", why);
+    CHECK(!open_text(settings_8192, why, sizeof why) && strcmp(why, over) == 0,
+          "open refuses 8193 bytes: '%s'", why);
+}
+
+static char name_settings[1100];
+
+static char name_ref[1100];
+
+static void a_name_at_the_cap_is_served(void) {
+    char why[256];
+    uint32_t kind;
+    uint8_t buf[16];
+    size_t k;
+    bb_secret_ResolveOut out;
+    void *inst;
+    strcpy(name_settings, "{\"values\": {\"");
+    for (k = 0; k < 1024; k++) {
+        strcat(name_settings, "n");
+    }
+    strcat(name_settings, "\": \"v\"}}");
+    CHECK(validate(name_settings, why, sizeof why), "a 1024-byte name validates: '%s'", why);
+    inst = open_instance(name_settings);
+    CHECK(inst != 0, "a 1024-byte name opens");
+    if (inst == 0) {
+        return;
+    }
+    strcpy(name_ref, "{\"name\": \"");
+    for (k = 0; k < 1024; k++) {
+        strcat(name_ref, "n");
+    }
+    strcat(name_ref, "\"}");
+    memset(buf, 0, sizeof buf);
+    out = resolve_into(inst, name_ref, buf, sizeof buf, why, sizeof why);
+    CHECK(out.head.outcome == BB_MECH_Outcome_Ready && out.secret.len == 1 && buf[0] == 'v',
+          "a 1024-byte name resolves: outcome %u '%s'", out.head.outcome, why);
+    memset(buf, 0, sizeof buf);
+    strcpy(name_ref, "{\"name\": \"");
+    for (k = 0; k < 1025; k++) {
+        strcat(name_ref, "n");
+    }
+    strcat(name_ref, "\"}");
+    CHECK(resolve(inst, name_ref, &kind, why, sizeof why) == BB_MECH_Outcome_Failed &&
+              kind == BB_SECRET_ERROR_KIND_NOT_FOUND &&
+              strcmp(why, "c holds no secret by that name") == 0,
+          "a 1025-byte name is NOT_FOUND: kind=%u '%s'", kind, why);
+    close_instance(inst);
+}
+
+static void an_accepted_refresh_serves_the_new_value(void) {
+    char why[256];
+    uint8_t buf[64];
+    bb_secret_ResolveOut out;
+    void *inst = open_instance("{\"values\": {\"db\": \"one-longer\"}}");
+    CHECK(inst != 0, "opens");
+    if (inst == 0) {
+        return;
+    }
+    CHECK(held_copies("one-longer") == 1, "the settings hold the first value once");
+    CHECK(refresh(inst, "{\"values\": {\"db\": \"two\"}}"), "a good refresh is accepted");
+    memset(buf, 0, sizeof buf);
+    out = resolve_into(inst, "{\"name\": \"db\"}", buf, sizeof buf, why, sizeof why);
+    CHECK(out.head.outcome == BB_MECH_Outcome_Ready && out.secret.len == 3 &&
+              memcmp(buf, "two", 3) == 0,
+          "the refresh serves the new value: outcome %u len %llu '%s'", out.head.outcome,
+          (unsigned long long)out.secret.len, why);
+    CHECK(held_copies("nger") == 0, "the old settings were zeroed: %d copies",
+          held_copies("nger"));
+    memset(buf, 0, sizeof buf);
+    close_instance(inst);
+}
+
+static void every_escape_decodes_to_its_bytes(void) {
+    static const char want[] = "q\"b\\s/\bf\fn\nr\rt\t" "\xE2\x82\xAC" "e";
+    char why[256];
+    uint8_t buf[64];
+    bb_secret_ResolveOut out;
+    void *inst = open_instance("{\"values\": {\"e\": \"q\\\"b\\\\s\\/\\bf\\fn\\nr\\rt\\t\\u20ace\"}}");
+    CHECK(inst != 0, "every escape opens");
+    if (inst != 0) {
+        memset(buf, 0, sizeof buf);
+        out = resolve_into(inst, "{\"name\": \"e\"}", buf, sizeof buf, why, sizeof why);
+        CHECK(out.head.outcome == BB_MECH_Outcome_Ready && out.secret.len == sizeof want - 1 &&
+                  memcmp(buf, want, sizeof want - 1) == 0,
+              "the escapes decode to their bytes: outcome %u len %llu '%s'", out.head.outcome,
+              (unsigned long long)out.secret.len, why);
+        memset(buf, 0, sizeof buf);
+        close_instance(inst);
+    }
+    CHECK(!validate("{\"values\": {\"e\": \"a\x01" "b\"}}", why, sizeof why),
+          "a raw control byte inside a string is refused");
+    CHECK(!validate("{\"values\": {\"e\": \"\\u12g4\"}}", why, sizeof why),
+          "a bad hex digit in a \\u escape is refused");
+}
+
+static void a_null_in_is_a_fault(void) {
+    bb_mech_OutHead out;
+    bb_mech_OpenOut oout;
+    bb_secret_ResolveOut rout;
+    void *inst = open_instance("{\"values\": {\"db\": \"one\"}}");
+    CHECK(inst != 0, "opens");
+    if (inst == 0) {
+        return;
+    }
+    memset(&out, 0, sizeof out);
+    out.size = sizeof out;
+    CHECK(head_ops()->validate(0, 0, &out) == BB_MECH_Outcome_Fault &&
+              out.outcome == BB_MECH_Outcome_Fault,
+          "validate: a NULL in is a FAULT");
+    memset(&oout, 0, sizeof oout);
+    oout.head.size = sizeof oout;
+    CHECK(head_ops()->open(0, 0, &oout) == BB_MECH_Outcome_Fault &&
+              oout.head.outcome == BB_MECH_Outcome_Fault,
+          "open: a NULL in is a FAULT");
+    memset(&out, 0, sizeof out);
+    out.size = sizeof out;
+    CHECK(head_ops()->refresh(inst, 0, &out) == BB_MECH_Outcome_Fault &&
+              out.outcome == BB_MECH_Outcome_Fault,
+          "refresh: a NULL in is a FAULT");
+    memset(&out, 0, sizeof out);
+    out.size = sizeof out;
+    CHECK(head_ops()->release(inst, 0, &out) == BB_MECH_Outcome_Fault &&
+              out.outcome == BB_MECH_Outcome_Fault,
+          "release: a NULL in is a FAULT");
+    memset(&rout, 0, sizeof rout);
+    rout.head.size = sizeof rout;
+    CHECK(secret_ops()->resolve(inst, 0, &rout) == BB_MECH_Outcome_Fault &&
+              rout.head.outcome == BB_MECH_Outcome_Fault,
+          "resolve: a NULL in is a FAULT");
+    close_instance(inst);
+}
+
+static void a_second_open_is_refused(void) {
+    char why[256];
+    uint8_t buf[16];
+    bb_secret_ResolveOut out;
+    void *inst = open_instance("{\"values\": {\"db\": \"one\"}}");
+    CHECK(inst != 0, "opens");
+    if (inst == 0) {
+        return;
+    }
+    CHECK(!open_text("{\"values\": {\"db\": \"two\"}}", why, sizeof why) &&
+              strcmp(why, "one instance only") == 0,
+          "a second open is refused: '%s'", why);
+    memset(buf, 0, sizeof buf);
+    out = resolve_into(inst, "{\"name\": \"db\"}", buf, sizeof buf, why, sizeof why);
+    CHECK(out.head.outcome == BB_MECH_Outcome_Ready && out.secret.len == 3 &&
+              memcmp(buf, "one", 3) == 0,
+          "the live instance still serves its own value: '%s'", why);
+    memset(buf, 0, sizeof buf);
+    close_instance(inst);
+}
+
+static char deep[20100];
+
+static void nest(size_t n, const char *open_, const char *inner, const char *close_) {
+    size_t k;
+    strcpy(deep, open_);
+    for (k = 0; k < n; k++) {
+        strcat(deep, "[");
+    }
+    strcat(deep, inner);
+    for (k = 0; k < n; k++) {
+        strcat(deep, "]");
+    }
+    strcat(deep, close_);
+}
+
+static void nesting_is_capped(void) {
+    char why[256];
+    uint32_t kind;
+    void *inst;
+    nest(32, "{\"values\": {\"db\": \"x\"}, \"x\": ", "", "}");
+    CHECK(!validate(deep, why, sizeof why) && strcmp(why, "settings: `values` is the only setting") == 0,
+          "32 arrays deep parses (refused as another setting): '%s'", why);
+    nest(33, "{\"values\": {\"db\": \"x\"}, \"x\": ", "", "}");
+    CHECK(!validate(deep, why, sizeof why) && strcmp(why, NOT_OBJECT_TEXT) == 0,
+          "past the depth cap is refused as not parseable: '%s'", why);
+    inst = open_instance("{\"values\": {\"db\": \"one\"}}");
+    CHECK(inst != 0, "opens");
+    if (inst == 0) {
+        return;
+    }
+    nest(10000, "{\"name\": \"db\", \"x\": ", "", "}");
+    CHECK(resolve(inst, deep, &kind, why, sizeof why) == BB_MECH_Outcome_Failed &&
+              kind == BB_SECRET_ERROR_KIND_INVALID &&
+              strcmp(why, "secret reference settings must be well-formed JSON, nested at most 32 deep, with no unpaired \\u surrogate") == 0,
+          "a reference nested 10000 deep is refused: kind=%u '%s'", kind, why);
+    close_instance(inst);
+}
+
+static void check_and_short_in_frames(void) {
+    a_second_open_keeps_the_first_instance_and_check_stays_unserved();
+    input_prefixes_default_only_whole_fields();
+}
+
+#if defined(__SANITIZE_THREAD__)
+#define UNDER_TSAN 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define UNDER_TSAN 1
+#endif
+#endif
+#ifndef UNDER_TSAN
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
+static int dead_stack_holds(uint32_t a, uint32_t b) {
+    volatile uint8_t probe[8192];
+    size_t k;
+    int found = 0;
+    for (k = 0; k + 4 <= sizeof probe; k += 4) {
+        uint32_t w = (uint32_t)probe[k] | ((uint32_t)probe[k + 1] << 8) |
+                     ((uint32_t)probe[k + 2] << 16) | ((uint32_t)probe[k + 3] << 24);
+        if (w == a || w == b) {
+            found++;
+        }
+    }
+    return found;
+}
+
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
+static void validate_the_pair(void) {
+    char why[256];
+    CHECK(validate("{\"values\": {\"api\": \"k\\ud83d\\udca9y\"}}", why, sizeof why),
+          "the pair validates: %s", why);
+}
+
+static void the_decoding_scratch_is_wiped(void) {
+    validate_the_pair();
+    CHECK(dead_stack_holds(0x1F4A9u, 0xDCA9u) == 0,
+          "a decoded code point stayed on the dead stack");
+}
+#else
+static void the_decoding_scratch_is_wiped(void) {}
+#endif
+
+
 int main(void) {
     a_resolve_leaves_no_copy_behind();
     a_value_over_the_buffer_is_the_short_answer();
@@ -1349,6 +1638,15 @@ int main(void) {
     a_second_open_keeps_the_first_instance_and_check_stays_unserved();
     input_prefixes_default_only_whole_fields();
     refused_candidates_are_not_echoed_or_kept();
+    the_decoding_scratch_is_wiped();
+    the_settings_cap_is_enforced_at_its_boundary();
+    a_name_at_the_cap_is_served();
+    an_accepted_refresh_serves_the_new_value();
+    every_escape_decodes_to_its_bytes();
+    a_null_in_is_a_fault();
+    a_second_open_is_refused();
+    nesting_is_capped();
+    check_and_short_in_frames();
     if (failures) {
         fprintf(stderr, "%d failure(s)\n", failures);
         return 1;
