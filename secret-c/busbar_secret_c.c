@@ -37,8 +37,9 @@
  * WHAT IT HOLDS: the material lives in the instance's kept settings, zeroed (volatile writes) when
  * a `refresh` replaces them and when it is closed. A resolve decodes into the host's buffer
  * byte by byte; the few bytes of decoding scratch on its stack are zeroed before it returns.
- * The rest of the lifecycle (retire, tick, drive, cancel) answers READY. An `out` shorter than its
- * head is a FAULT at every op, written nothing.
+ * The rest of the lifecycle (retire, tick, drive, cancel) answers READY. An `out` shorter than the
+ * op's own out struct (the head, for most ops; the whole OpenOut, TickOut, CancelOut or ResolveOut
+ * for open, tick, cancel and resolve) is a FAULT at every op, written nothing.
  *
  * BUSBAR_PLUGIN_KIND_ABI (default BB_SECRET_ABI_VERSION) is the kind ABI the door and its
  * Statement state. busbar's C conformance builds this source again with another value: the
