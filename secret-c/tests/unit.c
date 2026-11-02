@@ -296,6 +296,48 @@ static void settings_are_judged_whole(void) {
     }
 }
 
+/* SETTINGS_CAP (8192) is the most the instance keeps: a blob of exactly that many bytes is kept,
+ * one more is refused at validate, open and refresh alike, never copied past the instance. */
+static char settings_8192[8193 + 64];
+
+static void the_settings_cap_is_enforced_at_its_boundary(void) {
+    static const char head[] = "{\"values\": {\"db\": \"x\"}}";
+    static const char over[] = "settings: larger than this plugin keeps";
+    char why[256];
+    size_t k, n = strlen(head);
+    void *inst;
+    uint8_t buf[8];
+    bb_secret_ResolveOut out;
+    memcpy(settings_8192, head, n);
+    for (k = n; k < 8192; k++) {
+        settings_8192[k] = ' ';
+    }
+    settings_8192[8192] = 0;
+    CHECK(validate(settings_8192, why, sizeof why), "8192 bytes validate: '%s'", why);
+    inst = open_instance(settings_8192);
+    CHECK(inst != 0, "8192 bytes open");
+    if (inst != 0) {
+        memset(buf, 0, sizeof buf);
+        out = resolve_into(inst, "{\"name\": \"db\"}", buf, sizeof buf, why, sizeof why);
+        CHECK(out.head.outcome == BB_MECH_Outcome_Ready && out.secret.len == 1 && buf[0] == 'x',
+              "8192 bytes are kept whole and served");
+        settings_8192[8192] = ' ';
+        settings_8192[8193] = 0;
+        CHECK(!refresh_text(inst, settings_8192, why, sizeof why) && strcmp(why, over) == 0,
+              "refresh refuses 8193 bytes: '%s'", why);
+        out = resolve_into(inst, "{\"name\": \"db\"}", buf, sizeof buf, why, sizeof why);
+        CHECK(out.head.outcome == BB_MECH_Outcome_Ready && out.secret.len == 1,
+              "a refused over-cap refresh kept the old settings");
+        close_instance(inst);
+    }
+    settings_8192[8192] = ' ';
+    settings_8192[8193] = 0;
+    CHECK(!validate(settings_8192, why, sizeof why) && strcmp(why, over) == 0,
+          "validate refuses 8193 bytes: '%s'", why);
+    CHECK(!open_text(settings_8192, why, sizeof why) && strcmp(why, over) == 0,
+          "open refuses 8193 bytes: '%s'", why);
+}
+
 static void references_name_only_a_non_empty_name(void) {
     char why[256];
     uint32_t kind;
@@ -336,7 +378,8 @@ static void *refresher(void *inst) {
 static void refresh_and_resolve_do_not_race(void) {
     pthread_t t;
     char why[256];
-    uint32_t kind;
+    uint8_t buf[64];
+    bb_secret_ResolveOut out;
     int k, torn = 0;
     void *inst = open_instance("{\"values\": {\"db\": \"one\"}}");
     CHECK(inst != 0, "opens");
@@ -345,12 +388,17 @@ static void refresh_and_resolve_do_not_race(void) {
     }
     pthread_create(&t, 0, refresher, inst);
     for (k = 0; k < 2000; k++) {
-        if (resolve(inst, "{\"name\": \"db\"}", &kind, why, sizeof why) != BB_MECH_Outcome_Ready) {
+        memset(buf, 0, sizeof buf);
+        out = resolve_into(inst, "{\"name\": \"db\"}", buf, sizeof buf, why, sizeof why);
+        if (out.head.outcome != BB_MECH_Outcome_Ready || out.secret.len != 3 ||
+            (memcmp(buf, "one", 3) != 0 && memcmp(buf, "two", 3) != 0)) {
             torn++;
         }
+        memset(buf, 0, sizeof buf);
     }
     pthread_join(t, 0);
-    CHECK(torn == 0, "%d resolves of a held name failed while refresh ran", torn);
+    CHECK(torn == 0, "%d resolves were not READY with exactly 'one' or 'two' while refresh ran",
+          torn);
     CHECK(refused_refreshes == 0, "%d refreshes were refused: the race was never run",
           refused_refreshes);
     close_instance(inst);
@@ -452,6 +500,31 @@ static void a_refused_refresh_keeps_the_old_values(void) {
     close_instance(inst);
 }
 
+/* An accepted refresh serves the new value (rotation): the shorter value is served whole, with
+ * nothing left of the longer one before it, and the old settings are zeroed. */
+static void an_accepted_refresh_serves_the_new_value(void) {
+    char why[256];
+    uint8_t buf[64];
+    bb_secret_ResolveOut out;
+    void *inst = open_instance("{\"values\": {\"db\": \"one-longer\"}}");
+    CHECK(inst != 0, "opens");
+    if (inst == 0) {
+        return;
+    }
+    CHECK(held_copies("one-longer") == 1, "the settings hold the first value once");
+    CHECK(refresh(inst, "{\"values\": {\"db\": \"two\"}}"), "a good refresh is accepted");
+    memset(buf, 0, sizeof buf);
+    out = resolve_into(inst, "{\"name\": \"db\"}", buf, sizeof buf, why, sizeof why);
+    CHECK(out.head.outcome == BB_MECH_Outcome_Ready && out.secret.len == 3 &&
+              memcmp(buf, "two", 3) == 0,
+          "the refresh serves the new value: outcome %u len %llu '%s'", out.head.outcome,
+          (unsigned long long)out.secret.len, why);
+    CHECK(held_copies("one-longer") == 0, "the old settings were zeroed: %d copies",
+          held_copies("one-longer"));
+    memset(buf, 0, sizeof buf);
+    close_instance(inst);
+}
+
 /* A reference names `name` once, as a string. */
 static void a_reference_names_name_once_as_a_string(void) {
     char why[256];
@@ -499,6 +572,31 @@ static void a_surrogate_pair_decodes_to_utf8(void) {
           "an unpaired low surrogate is refused");
     CHECK(!validate("{\"values\": {\"e\": \"\\ud83d\\u0041\"}}", why, sizeof why),
           "a high surrogate followed by a non-surrogate is refused");
+}
+
+/* Every simple escape and a 3-byte \u escape decode to the exact bytes the host is handed; a raw
+ * control byte and a bad hex digit inside a string are refused. */
+static void every_escape_decodes_to_its_bytes(void) {
+    static const char want[] = "q\"b\\s/\bf\fn\nr\rt\t" "\xE2\x82\xAC" "e";
+    char why[256];
+    uint8_t buf[64];
+    bb_secret_ResolveOut out;
+    void *inst = open_instance("{\"values\": {\"e\": \"q\\\"b\\\\s\\/\\bf\\fn\\nr\\rt\\t\\u20ace\"}}");
+    CHECK(inst != 0, "every escape opens");
+    if (inst != 0) {
+        memset(buf, 0, sizeof buf);
+        out = resolve_into(inst, "{\"name\": \"e\"}", buf, sizeof buf, why, sizeof why);
+        CHECK(out.head.outcome == BB_MECH_Outcome_Ready && out.secret.len == sizeof want - 1 &&
+                  memcmp(buf, want, sizeof want - 1) == 0,
+              "the escapes decode to their bytes: outcome %u len %llu '%s'", out.head.outcome,
+              (unsigned long long)out.secret.len, why);
+        memset(buf, 0, sizeof buf);
+        close_instance(inst);
+    }
+    CHECK(!validate("{\"values\": {\"e\": \"a\x01" "b\"}}", why, sizeof why),
+          "a raw control byte inside a string is refused");
+    CHECK(!validate("{\"values\": {\"e\": \"\\u12g4\"}}", why, sizeof why),
+          "a bad hex digit in a \\u escape is refused");
 }
 
 /* An `out` shorter than its head is a FAULT, written nothing, at every op (as `check` answers). */
@@ -760,13 +858,16 @@ int main(void) {
     a_resolve_leaves_no_copy_behind();
     a_value_over_the_buffer_is_the_short_answer();
     settings_are_judged_whole();
+    the_settings_cap_is_enforced_at_its_boundary();
     references_name_only_a_non_empty_name();
     refresh_and_resolve_do_not_race();
     a_value_at_the_cap_is_served();
     every_kept_name_can_be_resolved();
     a_refused_refresh_keeps_the_old_values();
+    an_accepted_refresh_serves_the_new_value();
     a_reference_names_name_once_as_a_string();
     a_surrogate_pair_decodes_to_utf8();
+    every_escape_decodes_to_its_bytes();
     a_short_out_is_a_fault();
     instance_settings_use_the_shared_grammar();
     reference_refusals_use_the_vault_grammar();
