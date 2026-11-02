@@ -703,6 +703,10 @@ static bb_mech_RawOutcome op_validate(void *inst, const void *in, void *out) {
     if (o == 0 || o->size < sizeof *o) {
         return (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
     }
+    if (in == 0) {
+        o->outcome = (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
+        return (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
+    }
     if (v->head.size < sizeof *v) {
         return say(o, sizeof *o, BB_MECH_Outcome_Refused, "validate: short in");
     }
@@ -740,6 +744,10 @@ static bb_mech_RawOutcome op_open_held(void *inst, const void *in, void *out) {
     if (o == 0 || o->head.size < sizeof *o) {
         return (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
     }
+    if (in == 0) {
+        o->head.outcome = (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
+        return (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
+    }
     if (i->head.size < sizeof *i) {
         return say(&o->head, sizeof *o, BB_MECH_Outcome_Refused, "open: short frame");
     }
@@ -763,6 +771,10 @@ static bb_mech_RawOutcome op_refresh_held(void *inst, const void *in, void *out)
     bb_mech_OutHead *o = out;
     const char *why;
     if (o == 0 || o->size < sizeof *o) {
+        return (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
+    }
+    if (in == 0) {
+        o->outcome = (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
         return (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
     }
     if (r->head.size < sizeof *r) {
@@ -815,6 +827,10 @@ static bb_mech_RawOutcome op_release(void *inst, const void *in, void *out) {
     if (o == 0 || o->size < sizeof *o) {
         return (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
     }
+    if (in == 0) {
+        o->outcome = (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
+        return (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
+    }
     if (r->head.size < sizeof *r) {
         return say(o, sizeof *o, BB_MECH_Outcome_Refused, "release: short in");
     }
@@ -853,6 +869,10 @@ static bb_mech_RawOutcome op_resolve_held(void *inst, const void *in, void *out)
     int members;
     struct cursor c, probe;
     if (o == 0 || o->head.size < sizeof *o) {
+        return (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
+    }
+    if (in == 0) {
+        o->head.outcome = (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
         return (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
     }
     if (i->head.size < sizeof *i) {

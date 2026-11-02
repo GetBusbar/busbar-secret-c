@@ -717,6 +717,45 @@ static void a_short_out_is_a_fault_at_the_rest(void) {
     close_instance(inst);
 }
 
+/* An out-of-contract NULL `in` is a FAULT at validate, open, refresh, release and resolve, as
+ * `check` answers it, never a read through NULL. */
+static void a_null_in_is_a_fault(void) {
+    bb_mech_OutHead out;
+    bb_mech_OpenOut oout;
+    bb_secret_ResolveOut rout;
+    void *inst = open_instance("{\"values\": {\"db\": \"one\"}}");
+    CHECK(inst != 0, "opens");
+    if (inst == 0) {
+        return;
+    }
+    memset(&out, 0, sizeof out);
+    out.size = sizeof out;
+    CHECK(head_ops()->validate(0, 0, &out) == BB_MECH_Outcome_Fault &&
+              out.outcome == BB_MECH_Outcome_Fault,
+          "validate: a NULL in is a FAULT");
+    memset(&oout, 0, sizeof oout);
+    oout.head.size = sizeof oout;
+    CHECK(head_ops()->open(0, 0, &oout) == BB_MECH_Outcome_Fault &&
+              oout.head.outcome == BB_MECH_Outcome_Fault,
+          "open: a NULL in is a FAULT");
+    memset(&out, 0, sizeof out);
+    out.size = sizeof out;
+    CHECK(head_ops()->refresh(inst, 0, &out) == BB_MECH_Outcome_Fault &&
+              out.outcome == BB_MECH_Outcome_Fault,
+          "refresh: a NULL in is a FAULT");
+    memset(&out, 0, sizeof out);
+    out.size = sizeof out;
+    CHECK(head_ops()->release(inst, 0, &out) == BB_MECH_Outcome_Fault &&
+              out.outcome == BB_MECH_Outcome_Fault,
+          "release: a NULL in is a FAULT");
+    memset(&rout, 0, sizeof rout);
+    rout.head.size = sizeof rout;
+    CHECK(secret_ops()->resolve(inst, 0, &rout) == BB_MECH_Outcome_Fault &&
+              rout.head.outcome == BB_MECH_Outcome_Fault,
+          "resolve: a NULL in is a FAULT");
+    close_instance(inst);
+}
+
 int main(void) {
     a_resolve_leaves_no_copy_behind();
     a_value_over_the_buffer_is_the_short_answer();
@@ -735,6 +774,7 @@ int main(void) {
     release_is_refused_in_the_sdk_words();
     the_statement_states_its_alias();
     a_short_out_is_a_fault_at_the_rest();
+    a_null_in_is_a_fault();
     if (failures) {
         fprintf(stderr, "%d failure(s)\n", failures);
         return 1;
