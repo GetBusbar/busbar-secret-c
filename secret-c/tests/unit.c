@@ -251,16 +251,20 @@ static void a_value_over_the_buffer_is_the_short_answer(void) {
     if (inst == 0) {
         return;
     }
-    memset(buf, 0, sizeof buf);
+    memset(buf, 0xA5, sizeof buf);
     out = resolve_into(inst, "{\"name\": \"db\"}", buf, n - 1, why, sizeof why);
     CHECK(out.head.outcome == BB_MECH_Outcome_Failed && out.needed == n &&
               out.error_kind == BB_SECRET_ERROR_KIND_UNSET && out.secret.ptr == 0,
           "short: outcome %u needed %llu kind %u", out.head.outcome,
           (unsigned long long)out.needed, out.error_kind);
-    CHECK(buf[0] == 0, "a short answer writes nothing");
+    CHECK(buf[0] == 0xA5, "a short answer writes nothing");
+    memset(buf, 0xA5, sizeof buf);
     out = resolve_into(inst, "{\"name\": \"db\"}", buf, n, why, sizeof why);
     CHECK(out.head.outcome == BB_MECH_Outcome_Ready && out.secret.len == n,
           "the re-call with the size it named resolves");
+    CHECK(memcmp(buf, CANARY, n) == 0, "the exact-fit value is written whole");
+    CHECK(buf[n] == 0xA5, "nothing is written past the host's buffer (byte after: 0x%02x)",
+          buf[n]);
     memset(buf, 0, sizeof buf);
     close_instance(inst);
 }
