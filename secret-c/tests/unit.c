@@ -470,14 +470,58 @@ static void every_kept_name_can_be_resolved(void) {
     if (inst == 0) {
         return;
     }
-    CHECK(!refresh(inst, "{\"values\": {\"db\": \"one\", \"db\": \"two\"}}"),
-          "refresh refuses a name given twice");
+    CHECK(!refresh_text(inst, "{\"values\": {\"db\": \"one\", \"db\": \"two\"}}", why, sizeof why) &&
+              strcmp(why, "settings: a `values` name is given more than once") == 0,
+          "refresh refuses a name given twice: '%s'", why);
     close_instance(inst);
-    inst = open_instance("{\"values\": {\"\": \"x\"}}");
-    CHECK(inst == 0, "open refuses an empty name");
-    if (inst != 0) {
-        close_instance(inst);
+    CHECK(!open_text("{\"values\": {\"\": \"x\"}}", why, sizeof why) &&
+              strcmp(why, "settings: a `values` name is empty") == 0,
+          "open refuses an empty name: '%s'", why);
+}
+
+/* A name of exactly 1024 bytes (the most a reference may name) validates, opens and resolves; one
+ * byte more is NOT_FOUND, "c holds no secret by that name", never INVALID. */
+static char name_settings[1100];
+static char name_ref[1100];
+
+static void a_name_at_the_cap_is_served(void) {
+    char why[256];
+    uint32_t kind;
+    uint8_t buf[16];
+    size_t k;
+    bb_secret_ResolveOut out;
+    void *inst;
+    strcpy(name_settings, "{\"values\": {\"");
+    for (k = 0; k < 1024; k++) {
+        strcat(name_settings, "n");
     }
+    strcat(name_settings, "\": \"v\"}}");
+    CHECK(validate(name_settings, why, sizeof why), "a 1024-byte name validates: '%s'", why);
+    inst = open_instance(name_settings);
+    CHECK(inst != 0, "a 1024-byte name opens");
+    if (inst == 0) {
+        return;
+    }
+    strcpy(name_ref, "{\"name\": \"");
+    for (k = 0; k < 1024; k++) {
+        strcat(name_ref, "n");
+    }
+    strcat(name_ref, "\"}");
+    memset(buf, 0, sizeof buf);
+    out = resolve_into(inst, name_ref, buf, sizeof buf, why, sizeof why);
+    CHECK(out.head.outcome == BB_MECH_Outcome_Ready && out.secret.len == 1 && buf[0] == 'v',
+          "a 1024-byte name resolves: outcome %u '%s'", out.head.outcome, why);
+    memset(buf, 0, sizeof buf);
+    strcpy(name_ref, "{\"name\": \"");
+    for (k = 0; k < 1025; k++) {
+        strcat(name_ref, "n");
+    }
+    strcat(name_ref, "\"}");
+    CHECK(resolve(inst, name_ref, &kind, why, sizeof why) == BB_MECH_Outcome_Failed &&
+              kind == BB_SECRET_ERROR_KIND_NOT_FOUND &&
+              strcmp(why, "c holds no secret by that name") == 0,
+          "a 1025-byte name is NOT_FOUND: kind=%u '%s'", kind, why);
+    close_instance(inst);
 }
 
 /* A refused refresh keeps the instance serving what it served. */
@@ -490,7 +534,10 @@ static void a_refused_refresh_keeps_the_old_values(void) {
     if (inst == 0) {
         return;
     }
-    CHECK(!refresh(inst, "{\"values\": {\"db\": \"\"}}"), "an empty value is refused at refresh");
+    CHECK(!refresh_text(inst, "{\"values\": {\"db\": \"\"}}", why, sizeof why) &&
+              strcmp(why, "settings: a `values` entry is EMPTY; a secret must be non-empty "
+                          "(fail-closed)") == 0,
+          "an empty value is refused at refresh: '%s'", why);
     memset(buf, 0, sizeof buf);
     out = resolve_into(inst, "{\"name\": \"db\"}", buf, sizeof buf, why, sizeof why);
     CHECK(out.head.outcome == BB_MECH_Outcome_Ready && out.secret.len == 3 &&
@@ -854,6 +901,161 @@ static void a_null_in_is_a_fault(void) {
     close_instance(inst);
 }
 
+/* One instance only: a second open while one is live is refused, and the live one is untouched. */
+static void a_second_open_is_refused(void) {
+    char why[256];
+    uint8_t buf[16];
+    bb_secret_ResolveOut out;
+    void *inst = open_instance("{\"values\": {\"db\": \"one\"}}");
+    CHECK(inst != 0, "opens");
+    if (inst == 0) {
+        return;
+    }
+    CHECK(!open_text("{\"values\": {\"db\": \"two\"}}", why, sizeof why) &&
+              strcmp(why, "one instance only") == 0,
+          "a second open is refused: '%s'", why);
+    memset(buf, 0, sizeof buf);
+    out = resolve_into(inst, "{\"name\": \"db\"}", buf, sizeof buf, why, sizeof why);
+    CHECK(out.head.outcome == BB_MECH_Outcome_Ready && out.secret.len == 3 &&
+              memcmp(buf, "one", 3) == 0,
+          "the live instance still serves its own value: '%s'", why);
+    memset(buf, 0, sizeof buf);
+    close_instance(inst);
+}
+
+/* The depth cap (32) holds for settings and for resolve references: 32 deep parses, 33 does not,
+ * and a reference nested far deeper is refused without recursing to the end. */
+static char deep[20100];
+
+static void nest(size_t n, const char *open_, const char *inner, const char *close_) {
+    size_t k;
+    strcpy(deep, open_);
+    for (k = 0; k < n; k++) {
+        strcat(deep, "[");
+    }
+    strcat(deep, inner);
+    for (k = 0; k < n; k++) {
+        strcat(deep, "]");
+    }
+    strcat(deep, close_);
+}
+
+static void nesting_is_capped(void) {
+    char why[256];
+    uint32_t kind;
+    void *inst;
+        nest(32, "{\"values\": {\"db\": \"x\"}, \"x\": ", "", "}");
+    CHECK(!validate(deep, why, sizeof why) && strcmp(why, "settings: `values` is the only setting") == 0,
+          "32 arrays deep parses (refused as another setting): '%s'", why);
+    nest(33, "{\"values\": {\"db\": \"x\"}, \"x\": ", "", "}");
+    CHECK(!validate(deep, why, sizeof why) && strcmp(why, NOT_OBJECT_TEXT) == 0,
+          "past the depth cap is refused as not parseable: '%s'", why);
+    inst = open_instance("{\"values\": {\"db\": \"one\"}}");
+    CHECK(inst != 0, "opens");
+    if (inst == 0) {
+        return;
+    }
+    nest(10000, "{\"name\": \"db\", \"x\": ", "", "}");
+    CHECK(resolve(inst, deep, &kind, why, sizeof why) == BB_MECH_Outcome_Failed &&
+              kind == BB_SECRET_ERROR_KIND_INVALID &&
+              strcmp(why, "secret settings are not a JSON object") == 0,
+          "a reference nested 10000 deep is refused: kind=%u '%s'", kind, why);
+    close_instance(inst);
+}
+
+/* `check` judges no reference (REFUSED, "not served"); a NULL in or a short out is a FAULT. A
+ * frame whose head.size is shorter than its type is REFUSED, with the op's own words, at validate,
+ * open, refresh, resolve and release. */
+static void check_and_short_in_frames(void) {
+    bb_mech_ValidateIn vin;
+    bb_mech_OpenIn oin;
+    bb_mech_OpenOut oout;
+    bb_mech_RefreshIn rin;
+    bb_mech_ReleaseIn lin;
+    bb_secret_ResolveIn sin;
+    bb_secret_ResolveOut sout;
+    bb_mech_OutHead out;
+    char why[256];
+    uint8_t buf[64];
+    void *inst = open_instance("{\"values\": {\"db\": \"one\"}}");
+    CHECK(inst != 0, "opens");
+    if (inst == 0) {
+        return;
+    }
+    memset(&vin, 0, sizeof vin);
+    vin.head.size = sizeof vin;
+    memset(&out, 0, sizeof out);
+    out.size = sizeof out;
+    CHECK(secret_ops()->check(inst, &vin, &out) == BB_MECH_Outcome_Refused &&
+              out.outcome == BB_MECH_Outcome_Refused,
+          "check: REFUSED, not served");
+    memset(&out, 0, sizeof out);
+    out.size = sizeof out;
+    CHECK(secret_ops()->check(inst, 0, &out) == BB_MECH_Outcome_Fault &&
+              out.outcome == BB_MECH_Outcome_Fault,
+          "check: a NULL in is a FAULT");
+    memset(&out, 0, sizeof out);
+    out.size = 4;
+    CHECK(secret_ops()->check(inst, &vin, &out) == BB_MECH_Outcome_Fault && out.outcome == 0,
+          "check: a short out is a FAULT");
+    CHECK(secret_ops()->check(inst, &vin, 0) == BB_MECH_Outcome_Fault,
+          "check: a NULL out is a FAULT");
+
+    memset(&vin, 0, sizeof vin);
+    vin.head.size = 4;
+    vin.settings = blob("{\"values\": {\"db\": \"two\"}}");
+    vin.err_buf = buf;
+    vin.err_cap = sizeof buf;
+    memset(&out, 0, sizeof out);
+    out.size = sizeof out;
+    CHECK(head_ops()->validate(0, &vin, &out) == BB_MECH_Outcome_Refused, "validate: short in");
+    snprintf(why, sizeof why, "%.*s", (int)out.error.len, (const char *)out.error.ptr);
+    CHECK(strcmp(why, "validate: short in") == 0, "validate text: '%s'", why);
+
+    memset(&oin, 0, sizeof oin);
+    oin.head.size = 4;
+    oin.settings = blob("{\"values\": {\"db\": \"two\"}}");
+    oin.err_buf = buf;
+    oin.err_cap = sizeof buf;
+    memset(&oout, 0, sizeof oout);
+    oout.head.size = sizeof oout;
+    CHECK(head_ops()->open(0, &oin, &oout) == BB_MECH_Outcome_Refused, "open: short frame");
+    snprintf(why, sizeof why, "%.*s", (int)oout.head.error.len, (const char *)oout.head.error.ptr);
+    CHECK(strcmp(why, "open: short frame") == 0, "open text: '%s'", why);
+
+    memset(&rin, 0, sizeof rin);
+    rin.head.size = 4;
+    rin.settings = blob("{\"values\": {\"db\": \"two\"}}");
+    memset(&out, 0, sizeof out);
+    out.size = sizeof out;
+    CHECK(head_ops()->refresh(inst, &rin, &out) == BB_MECH_Outcome_Refused, "refresh: short in");
+    snprintf(why, sizeof why, "%.*s", (int)out.error.len, (const char *)out.error.ptr);
+    CHECK(strcmp(why, "refresh: short in") == 0, "refresh text: '%s'", why);
+
+    memset(&sin, 0, sizeof sin);
+    sin.head.size = 4;
+    sin.settings = blob("{\"name\": \"db\"}");
+    sin.secret_buf = buf;
+    sin.secret_cap = sizeof buf;
+    memset(buf, 0, sizeof buf);
+    memset(&sout, 0, sizeof sout);
+    sout.head.size = sizeof sout;
+    CHECK(secret_ops()->resolve(inst, &sin, &sout) == BB_MECH_Outcome_Refused && buf[0] == 0,
+          "resolve: short frame, nothing written");
+    snprintf(why, sizeof why, "%.*s", (int)sout.head.error.len, (const char *)sout.head.error.ptr);
+    CHECK(strcmp(why, "resolve: short frame") == 0, "resolve text: '%s'", why);
+
+    memset(&lin, 0, sizeof lin);
+    lin.head.size = 4;
+    lin.lease = 1;
+    memset(&out, 0, sizeof out);
+    out.size = sizeof out;
+    CHECK(head_ops()->release(inst, &lin, &out) == BB_MECH_Outcome_Refused, "release: short in");
+    snprintf(why, sizeof why, "%.*s", (int)out.error.len, (const char *)out.error.ptr);
+    CHECK(strcmp(why, "release: short in") == 0, "release text: '%s'", why);
+    close_instance(inst);
+}
+
 int main(void) {
     a_resolve_leaves_no_copy_behind();
     a_value_over_the_buffer_is_the_short_answer();
@@ -876,6 +1078,10 @@ int main(void) {
     the_statement_states_its_alias();
     a_short_out_is_a_fault_at_the_rest();
     a_null_in_is_a_fault();
+    a_name_at_the_cap_is_served();
+    a_second_open_is_refused();
+    nesting_is_capped();
+    check_and_short_in_frames();
     if (failures) {
         fprintf(stderr, "%d failure(s)\n", failures);
         return 1;
