@@ -32,11 +32,12 @@ jobs:
       service: none
       busbar_checkout: false
       macos_test: "cargo test --workspace --locked"
-      extra_test: ""
+      extra_test: "set -euo pipefail; work=$(mktemp -d); trap 'rm -rf \"$work\"' EXIT; inc=\"$BUSBAR_CHECKOUT/crates/busbar-contract/include\"; cc -std=c11 -Wall -Wextra -Werror -pedantic -pthread -DBUSBAR_SECRET_C_UNIT -I \"$inc\" secret-c/tests/unit.c -o \"$work/unit\"; \"$work/unit\"; cc -std=c11 -Wall -Wextra -Werror -pedantic -pthread -DBUSBAR_SECRET_C_UNIT -fsanitize=thread -g -I \"$inc\" secret-c/tests/unit.c -o \"$work/unit-tsan\"; TSAN_OPTIONS=halt_on_error=1 \"$work/unit-tsan\""
       plugin_crate: busbar-secret-c
       plugin_kind: secret
       plugin_alias: secret-c
       plugin_lang: c
       c_dir: secret-c
+      source_role: c_abi_test
     secrets:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
