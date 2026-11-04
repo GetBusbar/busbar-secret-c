@@ -13,7 +13,7 @@ Thanks for your interest in improving `busbar-secret-c`.
 ## Layout
 
 Every busbar plugin repo has the same skeleton. This one is a C plugin: `secret-c/` holds its `.c`
-sources, its `conformance.json` and its declares file. It includes `busbar_plugin.h` and nothing
+sources, ordinary tests and its declares file. It includes `busbar_plugin.h` and nothing
 else, the header taken from busbar at the commit in `.busbar-ref`. The CI, release and community
 files are rendered by `busbar-release plugin heal` from the fleet template (GetBusbar/busbar-release
 `template/`) and [busbar's plugin registry](https://github.com/GetBusbar/busbar/blob/main/plugins.yaml);
@@ -21,16 +21,16 @@ change them there, not here.
 
 ## This repo tests itself against busbar
 
-CI runs the fleet's one harness, busbar's reusable `plugin-ci.yml`, at the busbar commit in
-`.busbar-ref`, on its C path: the pin check (a Cargo.toml here is refused), the build from the
-header alone with `-std=c11 -Wall -Wextra -Werror -pedantic`, the signing gate for the kinds it
-covers, and busbar's `dropped_conformance` target, which loads the built library through busbar's
-plugin loader, drives this kind's conformance script over `secret-c/conformance.json`, and keeps a
-RED arm: the same sources rebuilt with `-DBUSBAR_PLUGIN_KIND_ABI=<another version>` must be
-refused. The source states its kind ABI through `BUSBAR_PLUGIN_KIND_ABI` for that reason.
+CI calls busbar's reusable `plugin-ci.yml` at the pinned commit. It validates the source pin,
+compiles the actual library against the public header, runs the applicable signing checks and
+executes this repository's ordinary `extra_test` command. `BUSBAR_PLUGIN_CDYLIB` names the fresh
+library; `BUSBAR_CHECKOUT` names the pinned header checkout. A missing test command is a failure.
+
+Keep behavior assertions with this implementation. The external C ABI witness is a separate test
+input with its own fixed contract, not a generic test framework or a built-in secret provider.
 
 ## Before you open a pull request
 
-Build it as the README's Build section does, and run the conformance as its Tests section does.
-Add or update `conformance.json` for any behavior change, and update the README when you change
+Build it as the README's Build section does, and run its ordinary tests.
+Add or update assertions for any behavior change, and update the README when you change
 behavior or config. Keep commits focused and describe what changed, why, and how it was verified.
