@@ -346,7 +346,7 @@ static void *refresher(void *inst) {
     for (k = 0; k < RACE_ITERATIONS; k++) {
         attempted_refreshes++;
         if (!refresh(inst, (k & 1) ? "{\"values\": {\"db\": \"one\"}}"
-                                   : "{\"values\": {\"db\": \"two\"}}")) {
+                                   : "{\"values\": {\"db\": \"second\"}}")) {
             refused_refreshes++;
         }
     }
@@ -357,7 +357,8 @@ static void *refresher(void *inst) {
 static int refresh_and_resolve_do_not_race(void) {
     pthread_t t;
     char why[256];
-    uint32_t kind;
+    uint8_t buf[16];
+    bb_secret_ResolveOut out;
     int k, status, torn = 0;
     void *inst = open_instance("{\"values\": {\"db\": \"one\"}}");
     CHECK(inst != 0, "opens");
@@ -378,11 +379,18 @@ static int refresh_and_resolve_do_not_race(void) {
     while (!atomic_load_explicit(&refresher_started, memory_order_acquire)) {
     }
     atomic_store_explicit(&refresher_go, 1, memory_order_release);
-    for (k = 0; k < RACE_ITERATIONS; k++) {
-        if (resolve(inst, "{\"name\": \"db\"}", &kind, why, sizeof why) != BB_MECH_Outcome_Ready) {
+    for (k = 0; k < RACE_ITERATIONS ||
+                !atomic_load_explicit(&refresher_completed, memory_order_acquire);
+         k++) {
+        memset(buf, 0, sizeof buf);
+        out = resolve_into(inst, "{\"name\": \"db\"}", buf, sizeof buf, why, sizeof why);
+        if (out.head.outcome != BB_MECH_Outcome_Ready || out.secret.ptr != buf ||
+            !((out.secret.len == 3 && memcmp(buf, "one", 3) == 0) ||
+              (out.secret.len == 6 && memcmp(buf, "second", 6) == 0))) {
             torn++;
         }
     }
+    memset(buf, 0, sizeof buf);
     status = pthread_join(t, 0);
     CHECK(status == 0, "pthread_join: %s", strerror(status));
     if (status != 0) {
@@ -395,7 +403,8 @@ static int refresh_and_resolve_do_not_race(void) {
           "the refresh worker never completed");
     CHECK(attempted_refreshes == RACE_ITERATIONS, "%d of %d refreshes ran",
           attempted_refreshes, RACE_ITERATIONS);
-    CHECK(torn == 0, "%d resolves of a held name failed while refresh ran", torn);
+    CHECK(torn == 0, "%d resolves of a held name failed or served neither whole value while "
+                     "refresh ran", torn);
     CHECK(refused_refreshes == 0, "%d refreshes were refused: the race was never run",
           refused_refreshes);
     close_instance(inst);
@@ -593,8 +602,12 @@ static void a_short_out_is_a_fault(void) {
     out.size = 4;
     CHECK(head_ops()->close(inst, 0, &out) == BB_MECH_Outcome_Fault && out.outcome == 0,
           "close: a short out is a FAULT");
-    CHECK(held_copies("one") == 1, "a faulted close left the instance as it was");
-    close_instance(inst);
+    CHECK(held_copies("one") == 0, "a faulted close still wipes the materials");
+    inst = open_instance("{\"values\": {\"db\": \"two\"}}");
+    CHECK(inst != 0, "a faulted close still closes the instance, so it opens again");
+    if (inst != 0) {
+        close_instance(inst);
+    }
 }
 
 
@@ -1541,9 +1554,21 @@ static void nesting_is_capped(void) {
     char why[256];
     uint32_t kind;
     void *inst;
-    nest(32, "{\"values\": {\"db\": \"x\"}, \"x\": ", "", "}");
+    nest(31, "{\"values\": {\"db\": \"x\"}, \"x\": ", "", "}");
     CHECK(!validate(deep, why, sizeof why) && strcmp(why, "settings: `values` is the only setting") == 0,
-          "32 arrays deep parses (refused as another setting): '%s'", why);
+          "32 containers deep parses (refused as another setting): '%s'", why);
+    nest(31, "{\"values\": {\"db\": \"x\"}, \"x\": ", "0", "}");
+    CHECK(!validate(deep, why, sizeof why) && strcmp(why, "settings: `values` is the only setting") == 0,
+          "32 containers deep parses whatever the innermost holds: '%s'", why);
+    nest(32, "{\"values\": {\"db\": \"x\"}, \"x\": ", "", "}");
+    CHECK(!validate(deep, why, sizeof why) && strcmp(why, NOT_OBJECT_TEXT) == 0,
+          "33 containers deep are refused even when the innermost is empty: '%s'", why);
+    nest(31, "{\"values\": {\"db\": \"x\"}, \"x\": ", "{}", "}");
+    CHECK(!validate(deep, why, sizeof why) && strcmp(why, NOT_OBJECT_TEXT) == 0,
+          "an empty object as the 33rd container is refused: '%s'", why);
+    nest(32, "{\"values\": {\"db\": \"x\"}, \"x\": ", "0", "}");
+    CHECK(!validate(deep, why, sizeof why) && strcmp(why, NOT_OBJECT_TEXT) == 0,
+          "33 containers deep are refused when the innermost holds a scalar: '%s'", why);
     nest(33, "{\"values\": {\"db\": \"x\"}, \"x\": ", "", "}");
     CHECK(!validate(deep, why, sizeof why) && strcmp(why, NOT_OBJECT_TEXT) == 0,
           "past the depth cap is refused as not parseable: '%s'", why);
@@ -1552,6 +1577,11 @@ static void nesting_is_capped(void) {
     if (inst == 0) {
         return;
     }
+    nest(32, "{\"name\": \"db\", \"x\": ", "", "}");
+    CHECK(resolve(inst, deep, &kind, why, sizeof why) == BB_MECH_Outcome_Failed &&
+              kind == BB_SECRET_ERROR_KIND_INVALID && strcmp(why, BAD_REFERENCE_OBJECT_TEXT) == 0,
+          "a reference 33 containers deep, innermost empty, names the depth: kind=%u '%s'", kind,
+          why);
     nest(10000, "{\"name\": \"db\", \"x\": ", "", "}");
     CHECK(resolve(inst, deep, &kind, why, sizeof why) == BB_MECH_Outcome_Failed &&
               kind == BB_SECRET_ERROR_KIND_INVALID &&
@@ -1624,8 +1654,29 @@ static void check_and_short_in_frames(void) {
         CHECK(buf[k] == 0xA5, "resolve: malformed shared-header control left byte %zu untouched", k);
     }
     close_instance(inst);
-    a_second_open_keeps_the_first_instance_and_check_stays_unserved();
-    input_prefixes_default_only_whole_fields();
+}
+
+static void check_answers_like_every_other_op(void) {
+    bb_secret_CheckIn check;
+    struct {
+        bb_mech_OutHead head;
+        uint8_t tail[16];
+    } wide;
+    bb_mech_OutHead out;
+    memset(&check, 0, sizeof check);
+    check.head.size = sizeof check;
+    memset(&wide, 0, sizeof wide);
+    wide.head.size = (uint32_t)sizeof wide;
+    CHECK(secret_ops()->check(0, &check, &wide.head) == BB_MECH_Outcome_Refused &&
+              wide.head.outcome == BB_MECH_Outcome_Refused &&
+              wide.head.size == sizeof(bb_mech_OutHead),
+          "check writes back its own out size: %u", (unsigned)wide.head.size);
+    check.head.size = sizeof(uint32_t);
+    memset(&out, 0, sizeof out);
+    out.size = sizeof out;
+    CHECK(secret_ops()->check(0, &check, &out) == BB_MECH_Outcome_Fault &&
+              out.outcome == BB_MECH_Outcome_Fault,
+          "check: an incomplete shared header faults, as at every other op");
 }
 
 void busbar_secret_c_reset_scratch_check(void);
@@ -1643,6 +1694,66 @@ static void the_decoding_scratch_is_wiped(void) {
           "an incomplete surrogate is refused");
     CHECK(busbar_secret_c_scratch_is_cleared(),
           "failed decoding clears its live code point, surrogate, hex and encoded scratch");
+}
+
+static void only_the_open_instance_is_served(void) {
+    static union {
+        size_t align;
+        uint8_t bytes[16384];
+    } foreign;
+    bb_mech_RefreshIn rin;
+    bb_mech_OutHead out;
+    bb_secret_ResolveOut rout;
+    uint8_t buf[64];
+    char why[256];
+    size_t k;
+    int untouched = 1;
+    void *inst = open_instance("{\"values\": {\"db\": \"one\"}}");
+    CHECK(inst != 0, "opens");
+    if (inst == 0) {
+        return;
+    }
+    close_instance(inst);
+    memset(&rin, 0, sizeof rin);
+    rin.head.size = sizeof rin;
+    rin.settings = blob("{\"values\": {\"db\": \"stored-after-close\"}}");
+    memset(&out, 0, sizeof out);
+    out.size = sizeof out;
+    CHECK(head_ops()->refresh(inst, &rin, &out) == BB_MECH_Outcome_Fault &&
+              out.outcome == BB_MECH_Outcome_Fault,
+          "refresh after close is a FAULT");
+    CHECK(held_copies("stored-after-close") == 0, "refresh after close kept settings nobody wipes");
+    memset(buf, 0, sizeof buf);
+    rout = resolve_into(inst, "{\"name\": \"db\"}", buf, sizeof buf, why, sizeof why);
+    CHECK(rout.head.outcome == BB_MECH_Outcome_Fault && rout.secret.ptr == 0,
+          "resolve after close is a FAULT: %u", (unsigned)rout.head.outcome);
+    memset(&out, 0, sizeof out);
+    out.size = sizeof out;
+    CHECK(head_ops()->close(inst, 0, &out) == BB_MECH_Outcome_Fault &&
+              out.outcome == BB_MECH_Outcome_Fault,
+          "a second close is a FAULT");
+    inst = open_instance("{\"values\": {\"db\": \"kept\"}}");
+    CHECK(inst != 0, "reopens");
+    if (inst == 0) {
+        return;
+    }
+    memset(foreign.bytes, 0xA5, sizeof foreign.bytes);
+    memset(&out, 0, sizeof out);
+    out.size = sizeof out;
+    CHECK(head_ops()->refresh(foreign.bytes, &rin, &out) == BB_MECH_Outcome_Fault,
+          "refresh of a foreign instance is a FAULT");
+    memset(&out, 0, sizeof out);
+    out.size = sizeof out;
+    CHECK(head_ops()->close(foreign.bytes, 0, &out) == BB_MECH_Outcome_Fault,
+          "close of a foreign instance is a FAULT");
+    for (k = 0; k < sizeof foreign.bytes; k++) {
+        if (foreign.bytes[k] != 0xA5) {
+            untouched = 0;
+        }
+    }
+    CHECK(untouched, "the foreign memory was written");
+    serves_bytes(inst, "{\"name\":\"db\"}", (const uint8_t *)"kept", 4);
+    close_instance(inst);
 }
 
 int main(void) {
@@ -1683,6 +1794,8 @@ int main(void) {
     a_second_open_is_refused();
     nesting_is_capped();
     check_and_short_in_frames();
+    check_answers_like_every_other_op();
+    only_the_open_instance_is_served();
     if (failures) {
         fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

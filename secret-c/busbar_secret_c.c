@@ -120,8 +120,7 @@ static void unlock(void) {
     SERVING++;
 }
 
-
-
+/* Every wipe stores through a volatile pointer, so the compiler cannot drop it as a dead store. */
 static void zero(volatile uint8_t *p, size_t n) {
     while (n--) {
         *p++ = 0;
@@ -410,7 +409,7 @@ static int number(struct cursor *c) {
 static int value(struct cursor *c, int depth) {
     size_t ignored;
     ws(c);
-    if (c->p >= c->end || depth > DEPTH_CAP) {
+    if (c->p >= c->end || ((*c->p == '[' || *c->p == '{') && depth >= DEPTH_CAP)) {
         return 0;
     }
     switch (*c->p) {
@@ -521,8 +520,8 @@ static int key_is(struct cursor *c, const uint8_t *want, size_t want_len) {
     return 1;
 }
 
-
-
+/* The walkers below (member, named_before, values_refusal, settings_refusal, only_member) run only
+ * over text one_object() accepted whole, so they step over ':' ',' '{' '}' without re-checking. */
 static int member(struct cursor *c, const char *want_text, const uint8_t *want, size_t want_len) {
     if (want_text != 0) {
         want = (const uint8_t *)want_text;
@@ -779,6 +778,10 @@ static bb_mech_RawOutcome op_validate(void *inst, const void *in, void *out) {
     return answer(o, sizeof *o, BB_MECH_Outcome_Failed);
 }
 
+/* Only the one open instance is served: any other pointer, or the instance after close, is FAULT. */
+static int held(const void *inst) {
+    return inst == (const void *)&THE_INSTANCE && THE_INSTANCE.open;
+}
 
 static const char *keep(struct instance *s, const bb_mech_Blob *settings) {
     const char *why = settings_refusal(settings->ptr, settings->len);
@@ -834,7 +837,7 @@ static bb_mech_RawOutcome op_refresh_held(void *inst, const void *in, void *out)
     if (o == 0 || o->size < sizeof *o) {
         return (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
     }
-    if (head == 0 || head->size < sizeof *head) {
+    if (head == 0 || head->size < sizeof *head || !held(inst)) {
         return answer(o, sizeof *o, BB_MECH_Outcome_Fault);
     }
     settings = input_blob(in, head->size, offsetof(bb_mech_RefreshIn, settings));
@@ -892,15 +895,21 @@ static bb_mech_RawOutcome op_release(void *inst, const void *in, void *out) {
 }
 
 static bb_mech_RawOutcome op_close_held(void *inst, const void *in, void *out) {
-    struct instance *s = inst;
     bb_mech_OutHead *o = out;
+    int ok = o != 0 && o->size >= sizeof *o;
     (void)in;
-    if (o == 0 || o->size < sizeof *o) {
+    if (!held(inst)) {
+        return ok ? answer(o, sizeof *o, BB_MECH_Outcome_Fault)
+                  : (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
+    }
+    /* The host treats a FAULTed close as closed too, so the materials are wiped and the instance
+     * closed before the out record is judged; a NULL or short out is still FAULT, written nothing. */
+    zero(THE_INSTANCE.settings, sizeof THE_INSTANCE.settings);
+    THE_INSTANCE.settings_len = 0;
+    THE_INSTANCE.open = 0;
+    if (!ok) {
         return (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
     }
-    zero(s->settings, sizeof s->settings);
-    s->settings_len = 0;
-    s->open = 0;
     return answer(o, sizeof *o, BB_MECH_Outcome_Ready);
 }
 
@@ -928,7 +937,7 @@ static bb_mech_RawOutcome op_resolve_held(void *inst, const void *in, void *out)
     if (o == 0 || o->head.size < sizeof *o) {
         return (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
     }
-    if (head == 0 || head->size < sizeof *head) {
+    if (head == 0 || head->size < sizeof *head || !held(inst)) {
         return answer(&o->head, sizeof *o, BB_MECH_Outcome_Fault);
     }
     settings = input_blob(in, head->size, offsetof(bb_secret_ResolveIn, settings));
@@ -1037,12 +1046,10 @@ static bb_mech_RawOutcome op_check(void *inst, const void *in, void *out) {
     if (o == 0 || o->size < sizeof *o) {
         return (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
     }
-    if (in == 0) {
-        o->outcome = (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
-        return (bb_mech_RawOutcome)BB_MECH_Outcome_Fault;
+    if (in == 0 || ((const bb_mech_InHead *)in)->size < sizeof(bb_mech_InHead)) {
+        return answer(o, sizeof *o, BB_MECH_Outcome_Fault);
     }
-    o->outcome = (bb_mech_RawOutcome)BB_MECH_Outcome_Refused;
-    return (bb_mech_RawOutcome)BB_MECH_Outcome_Refused;
+    return answer(o, sizeof *o, BB_MECH_Outcome_Refused);
 }
 
 

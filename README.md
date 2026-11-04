@@ -44,11 +44,15 @@ gets FAILED with `needed` equal to its decoded length, error kind UNSET, no leas
 written; the host retries with that capacity. `release` always answers REFUSED because no lease
 is granted. `check` also answers REFUSED: the plugin leaves config-time reference checking
 unserved, and `resolve` judges each reference. These are outcomes, not promised error strings.
-Each op requires its complete output record; a NULL or shorter output is FAULT, written nothing.
+Each op requires its complete output record; a NULL or shorter output is FAULT, written nothing
+(a `close` so answered still wipes the materials and closes the instance, as the host takes it as
+closed). `refresh`, `resolve` and `close` serve only the open instance: on any other pointer, or
+after `close`, they are FAULT and touch nothing.
 
 At most one instance, whose ops hold one lock (a `refresh` never races a `resolve`); at most
 8 KiB of settings (as written), 1 KiB of material per value and 1 KiB for each name (both decoded),
-and JSON nested at most 32 deep. `\u` escapes decode to UTF-8, a
+and JSON nested at most 32 containers deep (the top object is the first; scalars add no level).
+`\u` escapes decode to UTF-8, a
 surrogate pair to its 4 bytes; an unpaired surrogate is refused.
 
 ## Build
@@ -84,8 +88,8 @@ BUSBAR_C_ABI_LIBRARY=$PWD/target/libbusbar_secret_c.so BUSBAR_C_ABI_SOURCES=$PWD
 
 The unit tests (`secret-c/tests/unit.c`, not part of the plugin) drive the door directly for
 input field boundaries, refresh custody
-and credential-bearing refusals. The current normal CI `cunit` check runs them under
-ThreadSanitizer. To run them locally:
+and credential-bearing refusals. No CI check builds or runs them yet; run them under
+ThreadSanitizer locally:
 
 ```bash
 cc -std=c11 -Wall -Wextra -Werror -pedantic -fsanitize=thread -g -DBUSBAR_SECRET_C_UNIT \
