@@ -83,11 +83,48 @@ static const bb_mech_Rewrite REWRITES[] = {
     { .class_ = BB_MECH_REWRITE_ALIAS, .from = STR("secret-c"), .to = STR("") },
 };
 
+/* The one settings schema, exposed through the Statement as JSON bytes. */
+static const uint8_t SETTINGS_SCHEMA[] =
+    "{\n"
+    "  \"$schema\": \"https://json-schema.org/draft/2020-12/schema\",\n"
+    "  \"type\": \"object\",\n"
+    "  \"additionalProperties\": false,\n"
+    "  \"required\": [\n"
+    "    \"values\"\n"
+    "  ],\n"
+    "  \"properties\": {\n"
+    "    \"values\": {\n"
+    "      \"type\": \"object\",\n"
+    "      \"propertyNames\": {\n"
+    "        \"type\": \"string\",\n"
+    "        \"minLength\": 1,\n"
+    "        \"maxLength\": " TEXT(MATERIAL_CAP) ",\n"
+    "        \"x-maxUtf8Bytes\": " TEXT(MATERIAL_CAP) "\n"
+    "      },\n"
+    "      \"additionalProperties\": {\n"
+    "        \"type\": \"string\",\n"
+    "        \"minLength\": 1,\n"
+    "        \"maxLength\": " TEXT(MATERIAL_CAP) ",\n"
+    "        \"x-maxUtf8Bytes\": " TEXT(MATERIAL_CAP) ",\n"
+    "        \"writeOnly\": true\n"
+    "      },\n"
+    "      \"writeOnly\": true,\n"
+    "      \"description\": \"Names and secret strings must each decode to 1\\u20131024 UTF-8 bytes. Empty maps are accepted. Limits count bytes, not Unicode characters.\"\n"
+    "    }\n"
+    "  },\n"
+    "  \"x-maxSettingsBytes\": " TEXT(SETTINGS_CAP) ",\n"
+    "  \"x-maxJsonDepth\": " TEXT(DEPTH_CAP) ",\n"
+    "  \"description\": \"Required instance settings. The encoded JSON document is limited to 8192 bytes and nesting depth 32. Duplicate keys are refused. UTF-8 byte bounds and duplicate-key checks are additionally enforced by the lifecycle parser.\"\n"
+    "}\n"
+    ;
+
 static const bb_mech_Statement STATEMENT = {
     .size = (uint32_t)sizeof(bb_mech_Statement),
     .kind = (uint32_t)BB_MECH_KindCode_Secret,
     .kind_abi = BUSBAR_PLUGIN_KIND_ABI,
     .max_inflight = 1,
+    .settings_schema = { .ptr = SETTINGS_SCHEMA, .len = sizeof SETTINGS_SCHEMA - 1,
+                         .fmt = BB_MECH_BLOB_JSON },
     .name = STR("busbar-secret-c"),
     .version = STR("1.6.0"),
     .marks = BB_MECH_MARK_ONE_INSTANCE,
