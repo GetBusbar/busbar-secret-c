@@ -4,7 +4,6 @@ This repository supplies the external C input for Busbar's header-only build, dy
 and ABI-refusal tests. It uses the secret ABI table to exercise host-owned buffers and lifecycle
 calls. Its repository name and history remain available for reproducible test inputs.
 
-[![ci](https://github.com/GetBusbar/busbar-secret-c/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/GetBusbar/busbar-secret-c/actions/workflows/ci.yml)
 
 ## What it is for
 
