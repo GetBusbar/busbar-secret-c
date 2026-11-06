@@ -109,12 +109,12 @@ static const uint8_t SETTINGS_SCHEMA[] =
     "        \"writeOnly\": true\n"
     "      },\n"
     "      \"writeOnly\": true,\n"
-    "      \"description\": \"Names and secret strings must each decode to 1\\u20131024 UTF-8 bytes. Empty maps are accepted. Limits count bytes, not Unicode characters.\"\n"
+    "      \"description\": \"Names and secret strings must each decode to 1\\u2013" TEXT(MATERIAL_CAP) " UTF-8 bytes. Empty maps are accepted. Limits count bytes, not Unicode characters.\"\n"
     "    }\n"
     "  },\n"
     "  \"x-maxSettingsBytes\": " TEXT(SETTINGS_CAP) ",\n"
     "  \"x-maxJsonDepth\": " TEXT(DEPTH_CAP) ",\n"
-    "  \"description\": \"Required instance settings. The encoded JSON document is limited to 8192 bytes and nesting depth 32. Duplicate keys are refused. UTF-8 byte bounds and duplicate-key checks are additionally enforced by the lifecycle parser.\"\n"
+    "  \"description\": \"Required instance settings. The encoded JSON document is limited to " TEXT(SETTINGS_CAP) " bytes and nesting depth " TEXT(DEPTH_CAP) ". Duplicate keys are refused. UTF-8 byte bounds and duplicate-key checks are additionally enforced by the lifecycle parser.\"\n"
     "}\n"
     ;
 
@@ -255,6 +255,7 @@ struct string_scratch {
     uint32_t cp, lo;
     int h;
     uint8_t enc[4];
+    uint8_t min, max;
 };
 
 #ifdef BUSBAR_SECRET_C_UNIT
@@ -270,6 +271,45 @@ static void record_cleared_scratch(const volatile uint8_t *bytes, size_t len) {
 }
 #endif
 
+/* A raw byte from 0x80 leads a sequence that must be well-formed UTF-8 (RFC 3629 section 4):
+ * no stray continuation, overlong form, surrogate or code point past U+10FFFF, so raw text is
+ * refused exactly where its \u spelling would be. The lead is in s->enc[0]; *m becomes its length. */
+static int utf8_in(struct cursor *c, volatile struct string_scratch *s, size_t *m) {
+    size_t k;
+    s->min = 0x80;
+    s->max = 0xBF;
+    if (s->b >= 0xC2 && s->b <= 0xDF) {
+        *m = 2;
+    } else if (s->b >= 0xE0 && s->b <= 0xEF) {
+        *m = 3;
+        if (s->b == 0xE0) {
+            s->min = 0xA0;
+        } else if (s->b == 0xED) {
+            s->max = 0x9F;
+        }
+    } else if (s->b >= 0xF0 && s->b <= 0xF4) {
+        *m = 4;
+        if (s->b == 0xF0) {
+            s->min = 0x90;
+        } else if (s->b == 0xF4) {
+            s->max = 0x8F;
+        }
+    } else {
+        return 0;
+    }
+    if ((size_t)(c->end - c->p) < *m - 1) {
+        return 0;
+    }
+    for (k = 1; k < *m; k++) {
+        s->enc[k] = *c->p++;
+        if (s->enc[k] < s->min || s->enc[k] > s->max) {
+            return 0;
+        }
+        s->min = 0x80;
+        s->max = 0xBF;
+    }
+    return 1;
+}
 
 static int string_in(struct cursor *c, uint8_t *out, size_t cap, size_t *len,
                      volatile struct string_scratch *s) {
@@ -291,6 +331,9 @@ static int string_in(struct cursor *c, uint8_t *out, size_t cap, size_t *len,
         if (s->b != '\\') {
             s->enc[0] = s->b;
             m = 1;
+            if (s->b >= 0x80 && !utf8_in(c, s, &m)) {
+                return 0;
+            }
         } else {
             if (c->p >= c->end) {
                 return 0;

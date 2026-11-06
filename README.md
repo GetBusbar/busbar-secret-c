@@ -52,7 +52,9 @@ At most one instance, whose ops hold one lock (a `refresh` never races a `resolv
 8 KiB of settings (as written), 1 KiB of material per value and 1 KiB for each name (both decoded),
 and JSON nested at most 32 containers deep (the top object is the first; scalars add no level).
 `\u` escapes decode to UTF-8, a
-surrogate pair to its 4 bytes; an unpaired surrogate is refused.
+surrogate pair to its 4 bytes; an unpaired surrogate is refused. Raw bytes must be well-formed UTF-8
+(no stray continuation byte, overlong form, surrogate or code point past U+10FFFF); other text
+is refused as malformed JSON.
 
 ## Build
 
@@ -98,7 +100,8 @@ cc -std=c11 -Wall -Wextra -Werror -pedantic -fsanitize=thread -g -DBUSBAR_SECRET
 
 The case that reads the dead stack for decoding scratch needs a build without
 `-fsanitize=thread` (the sanitizer's own spills would fail it): run the same command once more
-with that flag removed.
+with `-fsanitize=address` in its place, which also catches a parser read past the end of
+settings handed over at their exact length.
 
 ## License
 

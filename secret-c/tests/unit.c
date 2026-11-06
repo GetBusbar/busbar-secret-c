@@ -24,6 +24,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 const bb_mech_Door *busbar_plugin_door(void);
@@ -1756,6 +1757,302 @@ static void only_the_open_instance_is_served(void) {
     close_instance(inst);
 }
 
+static void raw_bytes_must_be_utf8(void) {
+    static const char *const refused[] = {
+        "\xFF", "\x80", "\xC0\x80", "\xC1\x81", "\xC3", "\xE2\x82", "\xE0\x80\x80",
+        "\xED\xA0\x80", "\xED\xBF\xBF", "\xF0\x80\x80\x80", "\xF4\x90\x80\x80",
+        "\xF5\x80\x80\x80", "\xF8\x88\x80\x80\x80", "a\xC3(b",
+    };
+    static const char *const served[] = {
+        "\xC3\xA9", "\xE2\x82\xAC", "\xED\x9F\xBF", "\xEE\x80\x80", "\xEF\xBF\xBF",
+        "\xF0\x9F\x98\x80", "\xF4\x8F\xBF\xBF", "\xC2\x80",
+    };
+    char text[128], why[256];
+    size_t k;
+    uint32_t kind;
+    void *inst;
+    for (k = 0; k < sizeof refused / sizeof refused[0]; k++) {
+        snprintf(text, sizeof text, "{\"values\":{\"db\":\"%s\"}}", refused[k]);
+        refused_settings_everywhere(text, NOT_OBJECT_TEXT);
+        snprintf(text, sizeof text, "{\"values\":{\"%s\":\"x\"}}", refused[k]);
+        refused_settings_everywhere(text, NOT_OBJECT_TEXT);
+    }
+    for (k = 0; k < sizeof served / sizeof served[0]; k++) {
+        snprintf(text, sizeof text, "{\"values\":{\"db\":\"%s\",\"%s\":\"n\"}}", served[k],
+                 served[k]);
+        inst = open_instance(text);
+        CHECK(inst != 0, "valid raw UTF-8 %zu opens", k);
+        if (inst == 0) {
+            continue;
+        }
+        serves_bytes(inst, "{\"name\":\"db\"}", (const uint8_t *)served[k], strlen(served[k]));
+        snprintf(text, sizeof text, "{\"name\":\"%s\"}", served[k]);
+        serves_bytes(inst, text, (const uint8_t *)"n", 1);
+        close_instance(inst);
+    }
+    inst = open_instance("{\"values\":{\"db\":\"x\"}}");
+    CHECK(inst != 0, "opens for an invalid UTF-8 reference");
+    if (inst != 0) {
+        CHECK(resolve(inst, "{\"name\":\"\xED\xA0\x80\"}", &kind, why, sizeof why) ==
+                      BB_MECH_Outcome_Failed &&
+                  kind == BB_SECRET_ERROR_KIND_INVALID,
+              "a reference naming invalid UTF-8 is INVALID: %u '%s'", (unsigned)kind, why);
+        close_instance(inst);
+    }
+}
+
+static void every_json_whitespace_separates_tokens(void) {
+    void *inst = open_instance("\r\n{\r\n\t\"values\"\t:\n{\n\t\t\"db\" :\t\"x\",\r\n\t\t\"api\"\n:\r"
+                               "\"y\"\n\t}\r\n}\n\t ");
+    CHECK(inst != 0, "settings separated by tab, CR and LF open");
+    if (inst == 0) {
+        return;
+    }
+    serves_bytes(inst, "\n{\r\n\t\"name\"\t:\n\"api\"\r\n}\t", (const uint8_t *)"y", 1);
+    close_instance(inst);
+}
+
+static void a_null_buffer_with_capacity_is_the_short_answer(void) {
+    char why[256];
+    bb_secret_ResolveOut out;
+    void *inst = open_instance("{\"values\":{\"db\":\"abc\"}}");
+    CHECK(inst != 0, "opens");
+    if (inst == 0) {
+        return;
+    }
+    out = resolve_into(inst, "{\"name\":\"db\"}", 0, 64, why, sizeof why);
+    CHECK(out.head.outcome == BB_MECH_Outcome_Failed && out.needed == 3 &&
+              out.error_kind == BB_SECRET_ERROR_KIND_UNSET && out.secret.ptr == 0 &&
+              out.secret.len == 0,
+          "a NULL buffer is the short answer whatever its stated capacity: %u needed %llu",
+          (unsigned)out.head.outcome, (unsigned long long)out.needed);
+    close_instance(inst);
+}
+
+static void the_lifecycle_ops_answer_their_records(void) {
+    bb_mech_TickOut tick;
+    bb_mech_CancelOut cancel;
+    bb_mech_OutHead out;
+    void *inst = open_instance("{\"values\":{\"db\":\"x\"}}");
+    CHECK(inst != 0, "opens");
+    if (inst == 0) {
+        return;
+    }
+    memset(&tick, 0, sizeof tick);
+    tick.head.size = sizeof tick;
+    tick.next_tick_ns = 7;
+    CHECK(head_ops()->tick(inst, 0, &tick) == BB_MECH_Outcome_Ready &&
+              tick.head.outcome == BB_MECH_Outcome_Ready && tick.next_tick_ns == 0,
+          "tick is READY and asks for no further tick");
+    memset(&cancel, 0, sizeof cancel);
+    cancel.head.size = sizeof cancel;
+    cancel.disposition = 7;
+    CHECK(head_ops()->cancel(inst, 0, &cancel) == BB_MECH_Outcome_Ready &&
+              cancel.head.outcome == BB_MECH_Outcome_Ready &&
+              cancel.disposition == BB_SECRET_CANCEL_ABORTED,
+          "cancel is READY with the ABORTED disposition");
+    memset(&out, 0, sizeof out);
+    out.size = sizeof out;
+    CHECK(head_ops()->retire(inst, 0, &out) == BB_MECH_Outcome_Ready &&
+              out.outcome == BB_MECH_Outcome_Ready,
+          "retire is READY");
+    memset(&out, 0, sizeof out);
+    out.size = sizeof out;
+    CHECK(head_ops()->drive(inst, 0, &out) == BB_MECH_Outcome_Ready &&
+              out.outcome == BB_MECH_Outcome_Ready,
+          "drive is READY");
+    memset(&out, 0, sizeof out);
+    out.size = sizeof out;
+    CHECK(head_ops()->close(inst, 0, &out) == BB_MECH_Outcome_Ready &&
+              out.outcome == BB_MECH_Outcome_Ready && held_copies("x") == 0,
+          "close is READY and wipes the materials");
+}
+
+#define NOT_STRINGS_TEXT "settings: every `values` entry must be a string"
+#define ONLY_VALUES_TEXT "settings: `values` is the only setting"
+#define NAMES_ONLY_TEXT "c secret reference names only settings.name (fail-closed)"
+
+/* Well-formed JSON values of every type: the settings parse whole, and the refusal names the
+ * entry type (or the extra member), never the grammar. */
+static void every_json_value_type_parses_before_the_settings_rules(void) {
+    static const char *const values[] = {
+        "true", "false", "null", "0", "-0", "-12", "3.25", "-0.5e+10", "1E-3", "2e7",
+        "[]", "[ 1 , \"a\" , [true, null] ]", "{}", "{ \"k\" : { \"j\" : null } , \"m\" : [1,2] }",
+    };
+    char text[256], why[256];
+    uint32_t kind;
+    size_t k;
+    void *inst;
+    for (k = 0; k < sizeof values / sizeof values[0]; k++) {
+        snprintf(text, sizeof text, "{\"values\":{\"db\":%s}}", values[k]);
+        refused_settings_everywhere(text, NOT_STRINGS_TEXT);
+        snprintf(text, sizeof text, "{\"values\":{\"db\":\"x\"},\"extra\":%s}", values[k]);
+        refused_settings_everywhere(text, ONLY_VALUES_TEXT);
+    }
+    inst = open_instance("{\"values\":{\"db\":\"x\"}}");
+    CHECK(inst != 0, "opens for references with extra members of every type");
+    if (inst == 0) {
+        return;
+    }
+    for (k = 0; k < sizeof values / sizeof values[0]; k++) {
+        snprintf(text, sizeof text, "{\"extra\":%s,\"name\":\"db\"}", values[k]);
+        CHECK(resolve(inst, text, &kind, why, sizeof why) == BB_MECH_Outcome_Failed &&
+                  kind == BB_SECRET_ERROR_KIND_INVALID && strcmp(why, NAMES_ONLY_TEXT) == 0,
+              "an extra member holding %s is refused as extra: %u '%s'", values[k],
+              (unsigned)kind, why);
+    }
+    close_instance(inst);
+}
+
+/* Text cut off mid-token is handed over in a heap buffer of exactly its length, with no NUL
+ * after it, so a read past the end is caught by AddressSanitizer (see README). */
+static void refused_exact_everywhere(const char *text) {
+    size_t n = strlen(text);
+    uint8_t *exact = malloc(n);
+    bb_mech_ValidateIn in;
+    bb_mech_OutHead out;
+    uint8_t err[256];
+    CHECK(exact != 0, "allocates");
+    if (exact == 0) {
+        return;
+    }
+    memcpy(exact, text, n);
+    memset(&in, 0, sizeof in);
+    memset(&out, 0, sizeof out);
+    in.head.size = sizeof in;
+    in.settings.ptr = exact;
+    in.settings.len = n;
+    in.settings.fmt = BB_MECH_BLOB_JSON;
+    in.err_buf = err;
+    in.err_cap = sizeof err;
+    out.size = sizeof out;
+    CHECK(head_ops()->validate(0, &in, &out) == BB_MECH_Outcome_Failed &&
+              out.error.len == strlen(NOT_OBJECT_TEXT) &&
+              memcmp(out.error.ptr, NOT_OBJECT_TEXT, out.error.len) == 0,
+          "cut-off settings are malformed: '%s'", text);
+    free(exact);
+}
+
+/* Ill-formed JSON is refused as malformed wherever it sits, including text cut off mid-token. */
+static void malformed_json_tokens_are_refused_as_malformed(void) {
+    static const char *const values[] = {
+        "tru", "fals", "nul", "nulL", "trUe", "-", "-x", "+1", "1.", "1.e5", "1e", "1e+", "01",
+        "[1 2]", "[1,]", "[", "{\"k\" 1}", "{\"k\":1 \"j\":2}", "{1:2}", "{\"k\":}",
+        "\"\\uD800\\uZZZZ\"", "\"\\uD800\\u12\"",
+    };
+    static const char *const truncated[] = {
+        "{\"values\":{\"db\":\"abc", "{\"values\":{\"db\":\"\\", "{\"values\":{\"db\":\"\\u12",
+        "{\"values\":{\"db\":\"\xE2\x82", "{\"values\":{\"db\":\"\xF0\x9F\x98",
+        "{\"values\":{\"db\":\"\\uD83D\\uDE0", "{\"values\":{\"db\":tr", "{\"values\":{\"db\":",
+    };
+    char text[256], why[256];
+    uint32_t kind;
+    size_t k;
+    void *inst;
+    for (k = 0; k < sizeof values / sizeof values[0]; k++) {
+        snprintf(text, sizeof text, "{\"values\":{\"db\":%s}}", values[k]);
+        refused_settings_everywhere(text, NOT_OBJECT_TEXT);
+    }
+    for (k = 0; k < sizeof truncated / sizeof truncated[0]; k++) {
+        refused_exact_everywhere(truncated[k]);
+    }
+    inst = open_instance("{\"values\":{\"db\":\"x\"}}");
+    CHECK(inst != 0, "opens for malformed references");
+    if (inst == 0) {
+        return;
+    }
+    for (k = 0; k < sizeof values / sizeof values[0]; k++) {
+        snprintf(text, sizeof text, "{\"name\":\"db\",\"extra\":%s}", values[k]);
+        CHECK(resolve(inst, text, &kind, why, sizeof why) == BB_MECH_Outcome_Failed &&
+                  kind == BB_SECRET_ERROR_KIND_INVALID && strcmp(why, BAD_REFERENCE_OBJECT_TEXT) == 0,
+              "a reference holding %s is malformed: %u '%s'", values[k], (unsigned)kind, why);
+    }
+    CHECK(resolve(inst, "{\"name\":\"d", &kind, why, sizeof why) == BB_MECH_Outcome_Failed &&
+              kind == BB_SECRET_ERROR_KIND_INVALID && strcmp(why, BAD_REFERENCE_OBJECT_TEXT) == 0,
+          "a reference cut off inside the name is malformed: %u '%s'", (unsigned)kind, why);
+    serves_bytes(inst, "{\"name\":\"db\"}", (const uint8_t *)"x", 1);
+    close_instance(inst);
+}
+
+/* A blob with a length but no bytes is not an object: refused, never dereferenced. */
+static void a_null_settings_pointer_with_a_length_is_refused(void) {
+    bb_mech_ValidateIn vin;
+    bb_mech_OutHead vout;
+    bb_secret_ResolveIn rin;
+    bb_secret_ResolveOut rout;
+    uint8_t err[256], buf[64];
+    void *inst;
+    memset(&vin, 0, sizeof vin);
+    memset(&vout, 0, sizeof vout);
+    vin.head.size = sizeof vin;
+    vin.settings.ptr = 0;
+    vin.settings.len = 16;
+    vin.settings.fmt = BB_MECH_BLOB_JSON;
+    vin.err_buf = err;
+    vin.err_cap = sizeof err;
+    vout.size = sizeof vout;
+    CHECK(head_ops()->validate(0, &vin, &vout) == BB_MECH_Outcome_Failed &&
+              vout.error.len == strlen(NOT_OBJECT_TEXT) &&
+              memcmp(vout.error.ptr, NOT_OBJECT_TEXT, vout.error.len) == 0,
+          "validate refuses a NULL pointer with a length as not an object");
+    inst = open_instance("{\"values\":{\"db\":\"x\"}}");
+    CHECK(inst != 0, "opens for a NULL reference pointer");
+    if (inst == 0) {
+        return;
+    }
+    memset(&rin, 0, sizeof rin);
+    memset(&rout, 0, sizeof rout);
+    memset(buf, 0xA5, sizeof buf);
+    rin.head.size = sizeof rin;
+    rin.settings.ptr = 0;
+    rin.settings.len = 13;
+    rin.secret_buf = buf;
+    rin.secret_cap = sizeof buf;
+    rout.head.size = sizeof rout;
+    CHECK(secret_ops()->resolve(inst, &rin, &rout) == BB_MECH_Outcome_Failed &&
+              rout.error_kind == BB_SECRET_ERROR_KIND_INVALID && rout.secret.ptr == 0 &&
+              rout.head.error.len == strlen("secret settings are not a JSON object") &&
+              memcmp(rout.head.error.ptr, "secret settings are not a JSON object",
+                     rout.head.error.len) == 0 &&
+              buf[0] == 0xA5,
+          "resolve refuses a NULL reference pointer with a length as not an object");
+    close_instance(inst);
+}
+
+static char long_key_text[1300];
+
+/* A key longer than any name is still a key. Settings refuse it as an extra setting; a reference
+ * steps over it to find `name` (were it read as malformed, `name` would be missed), and refuses it
+ * as an extra member wherever it sits. */
+static void a_key_longer_than_any_name_is_an_extra_member(void) {
+    char why[256];
+    uint32_t kind;
+    size_t n;
+    void *inst;
+    strcpy(long_key_text, "{\"");
+    n = strlen(long_key_text);
+    memset(long_key_text + n, 'k', 1100);
+    strcpy(long_key_text + n + 1100, "\":1,\"values\":{\"db\":\"x\"}}");
+    refused_settings_everywhere(long_key_text, ONLY_VALUES_TEXT);
+    inst = open_instance("{\"values\":{\"db\":\"x\"}}");
+    CHECK(inst != 0, "opens for a long reference key");
+    if (inst == 0) {
+        return;
+    }
+    strcpy(long_key_text + n + 1100, "\":\"db\",\"name\":\"db\"}");
+    CHECK(resolve(inst, long_key_text, &kind, why, sizeof why) == BB_MECH_Outcome_Failed &&
+              kind == BB_SECRET_ERROR_KIND_INVALID && strcmp(why, NAMES_ONLY_TEXT) == 0,
+          "a long extra key before `name` is refused as extra: %u '%s'", (unsigned)kind, why);
+    strcpy(long_key_text, "{\"name\":\"db\",\"");
+    n = strlen(long_key_text);
+    memset(long_key_text + n, 'k', 1100);
+    strcpy(long_key_text + n + 1100, "\":\"db\"}");
+    CHECK(resolve(inst, long_key_text, &kind, why, sizeof why) == BB_MECH_Outcome_Failed &&
+              kind == BB_SECRET_ERROR_KIND_INVALID && strcmp(why, NAMES_ONLY_TEXT) == 0,
+          "a long extra key after `name` is refused as extra: %u '%s'", (unsigned)kind, why);
+    close_instance(inst);
+}
+
 int main(void) {
     a_resolve_leaves_no_copy_behind();
     a_value_over_the_buffer_is_the_short_answer();
@@ -1796,6 +2093,14 @@ int main(void) {
     check_and_short_in_frames();
     check_answers_like_every_other_op();
     only_the_open_instance_is_served();
+    raw_bytes_must_be_utf8();
+    every_json_whitespace_separates_tokens();
+    a_null_buffer_with_capacity_is_the_short_answer();
+    the_lifecycle_ops_answer_their_records();
+    every_json_value_type_parses_before_the_settings_rules();
+    malformed_json_tokens_are_refused_as_malformed();
+    a_null_settings_pointer_with_a_length_is_refused();
+    a_key_longer_than_any_name_is_an_extra_member();
     if (failures) {
         fprintf(stderr, "%d failure(s)\n", failures);
         return 1;
