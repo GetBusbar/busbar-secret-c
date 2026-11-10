@@ -1,0 +1,18 @@
+{
+  "sources": [
+    "secret-c/busbar_secret_c.c"
+  ],
+  "test-root": "secret-c",
+  "unit": {
+    "sources": [
+      "secret-c/tests/unit.c"
+    ],
+    "defines": [
+      "BUSBAR_SECRET_C_UNIT"
+    ]
+  },
+  "schema": {
+    "source": "secret-c/tests/settings_schema.c",
+    "driver": "secret-c/tests/settings_schema.py"
+  }
+}
