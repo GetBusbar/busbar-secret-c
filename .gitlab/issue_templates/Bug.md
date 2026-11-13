@@ -1,6 +1,6 @@
 ## Summary
 
-<!-- What went wrong, in one or two sentences. -->
+<!-- What went wrong, in one or two sentences, and when it started. -->
 
 ## Steps to reproduce
 
