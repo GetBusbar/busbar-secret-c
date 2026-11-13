@@ -13,6 +13,6 @@
 
 - Busbar core:
 - busbar-secret-c:
-- Platform:
+- Platform (OS and architecture):
 
 <!-- Do not paste secrets, tokens or private keys. Report security issues as described in SECURITY.md. -->
